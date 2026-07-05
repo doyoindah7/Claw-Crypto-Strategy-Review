@@ -208,3 +208,80 @@ confidence = 0.50 + 0.35 * (vol_score * mom_score)
 At TP 3%/SL 2%/WR 45%, EV = 0.05% per trade:
 - For $1/day profit: $1000 bankroll needed (10 trades/day × 20% sizing)
 - At $10 bankroll: this is a validation phase, not a profit phase
+
+---
+
+## 10. AI Analysis Findings (Round 3)
+
+> Critical findings: simulation is systematically optimistic, sizing is 2× full-Kelly
+
+### Simulation Realism Verdict
+
+| Simulation Aspect | Verdict | Impact |
+|-------------------|---------|--------|
+| Slippage cap 5bps | **OPTIMISTIC** | Real cost 30-50% higher than modeled. EV more negative than -0.21% |
+| Zero slippage on SL/TP exits | **OPTIMISTIC** | SL exits have adverse selection — slippage 1.5× worse than market orders |
+| Static spread | **OPTIMISTIC (mild)** | Spread widens during volatility, exactly when stops trigger |
+| No latency price impact | **OPTIMISTIC (minor)** | Second-order effect at 2s polling |
+| Independent position PnL | **OPTIMISTIC (major for risk)** | Doesn't bias WR but drastically underestimates drawdown variance |
+
+**Bottom line: EV -0.21% is likely an UPPER BOUND. Real EV is more negative. Simulation is NOT trustworthy for live capital decisions.**
+
+### Slippage Fix (Proposed)
+
+Replace Gaussian(μ=1.5, σ=1.0) cap 5bps with **mixture distribution**:
+- 80% of time (normal): Gaussian(μ=3, σ=2) cap 8bps
+- 20% of time (volatile): Gaussian(μ=20, σ=10) cap 60bps
+
+For SL exits specifically: multiply slippage by 1.5× due to adverse selection.
+
+### Kelly Sizing Correction
+
+Original proposal: N=5, e=20%, L=8 → total notional = **8.0× bankroll** — this is 2× full-Kelly, 4× half-Kelly.
+
+Kelly criterion for correlated positions: treat N concurrent meme positions as **one joint bet**.
+
+```
+f* = (p×TP - q×SL) / (TP×SL) = (0.45×0.03 - 0.55×0.02) / 0.0006 = 4.17 (full-Kelly)
+Half-Kelly target: ~2.0× bankroll
+Constraint: N × e × L ≤ 2.0
+```
+
+Valid configurations at half-Kelly:
+
+| N | e | L | N×e×L | Notional/pos ($10 bankroll) | Above $5 min? |
+|---|---|-------|-------|-----|------|
+| 3 | 8.5% | 8 | 2.04 | $6.80 | ✅ Barely |
+| 2 | 13% | 8 | 2.08 | $10.40 | ✅ Yes |
+| 1 | 25% | 8 | 2.00 | $20.00 | ✅ Comfortable |
+| 3 | 20% | 3 | 1.80 | $6.00 | ✅ Barely |
+| 2 | 33% | 3 | 1.98 | $10.00 | ✅ Yes |
+
+### Replay Pipeline Specs (Confirmed)
+
+| Parameter | Value |
+|-----------|-------|
+| Kline granularity | **1m** (not 5m — nearly free, eliminates biggest error source) |
+| Simulation window | max_hold_time from config (currently 900s = 15 min) |
+| Sample size for ±5% CI | 379 trades |
+| Current sample (~200 trades) | ±7% CI — enough for clear signals, not for 40-48% zone |
+| Data source | Binance REST API `/fapi/v1/klines` (1m, 240 candles = 4hr per call) |
+
+### Implementation Checklist (Ranked, Claude R3)
+
+1. Build replay pipeline (1m klines) — no capital needed
+2. Replay ~200 trades at TP3%/SL2% → **GATE: WR ≥50%** (above 44% breakeven + CI)
+3. Recompute multiplicative confidence + sweep threshold 0.50-0.70 → **GATE: expected profit positive in replay**
+4. Fix position sizing to half-Kelly (N×e×L ≤ 2.0) → **GATE: sizing within fractional-Kelly**
+5. Validate stop-market mechanics on testnet → **GATE: order placement/trigger/cancel work correctly**
+6. Switch exit simulation to stop-market realistic (add slippage) + reduce polling to TP-only
+7. Fix known simulation flaws (slippage mixture, SL exit slippage, position correlation)
+8. Switch fully to new params (no A/B at $10), monitor forward vs replay baseline
+9. Use Bayesian sequential testing for future parameter iteration
+
+### Confidence Formula Calibration
+
+- Apply AND-gate generically: `confidence = base + boost_scale × (score_1 × score_2 × ...)`
+- Each tier supplies its own component scores (e.g., Tier 2 uses RSI-extremity × volume, not momentum)
+- Calibrate caps from **90th/95th percentile of winning trades' vol_ratio and momentum** (not overall distribution)
+- Sweep threshold 0.50-0.70, optimize for **total expected profit** (WR×TP - (1-WR)×SL - cost × trade_count), not just WR
