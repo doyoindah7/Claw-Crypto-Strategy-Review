@@ -19,7 +19,13 @@ This is NOT a runnable bot. It is a **review artifact** containing:
 
 ```
 ├── README.md                          ← You are here
-├── insight.md                         ← ⚡ START HERE — 11 targeted questions for reviewers
+├── insight.md                         ← ⚡ START HERE — 11 targeted questions (Round 1)
+├── insight_followup.md                ← Round 2: 13 follow-up questions (F1-F13), quantitative deep dive
+├── insight_r3.md                      ← Round 3: 14 questions (R1-R14), implementation path + realism audit
+├── insight_r4.md                      ← Round 4: 17 questions (S1-S17), foundation fixes + alternative strategy research
+├── cross_analysis.md                  ← 🔥 Cross-analysis synthesis: 4-round findings, consensus, contradictions, decision framework
+├── data/
+│   └── PERFORMANCE_METRICS.md         ← Aggregate metrics, cost structure, breakeven tables
 ├── docs/
 │   ├── ARCHITECTURE.md                ← Crypto bot architecture, data flow, component diagram
 │   ├── STRATEGY.md                    ← Signal generation logic, 8-tier hierarchy, indicators
@@ -71,18 +77,30 @@ This is NOT a runnable bot. It is a **review artifact** containing:
 
 ## How to Review
 
-1. **⚡ Read `insight.md` first** — 11 targeted questions that need your sharpest reasoning
-2. Read `poly-reference/ARCHITECTURE_POLY.md` to understand the profitable original
-3. Read `docs/STRATEGY.md` for the current 8-tier signal logic
-4. Compare with `poly-reference/momentum_poly.py` to see the simpler Fifteen approach
-5. Check `docs/REALISTIC_EXECUTION.md` for execution cost analysis
-6. Browse `snippets/` for implementation details
-7. See `docs/OPEN_QUESTIONS.md` for broader known issues
+1. **🔥 Read `cross_analysis.md` first** — 4-round synthesis with consensus, contradictions, and decision framework
+2. **⚡ Read `insight.md`** — 11 original targeted questions (Round 1)
+3. Read `insight_followup.md` → `insight_r3.md` → `insight_r4.md` for the full progression
+4. Read `poly-reference/ARCHITECTURE_POLY.md` to understand the profitable original
+5. Read `docs/STRATEGY.md` for the current 8-tier signal logic
+6. Compare with `poly-reference/momentum_poly.py` to see the simpler Fifteen approach
+7. Check `docs/REALISTIC_EXECUTION.md` for execution cost analysis
+8. Browse `snippets/` for implementation details
+9. See `docs/OPEN_QUESTIONS.md` for broader known issues
 
 ## What We Want From You
 
-- **Why is the simple Fifteen strategy profitable while our complex 8-tier system struggles?**
-- Should we simplify back to Fifteen's approach (1 signal type, wide stops) on Binance?
-- Are tight stops (0.5% SL) viable on meme coins with real spread costs?
-- Is 20x leverage helping or hurting after fee impact?
+- **Cross-validate the 4-round findings** — are the conclusions in `cross_analysis.md` correct?
+- **Answer S12-S17** in `insight_r4.md` — research alternative strategies (HFT scalping, swing trading, Fifteen-direct-translation, etc.)
+- **Is meme-coin scalping on Binance USDM fundamentally viable at ANY scale?** Or should we pivot to a different strategy class entirely?
+- **What specific strategy would you run on Binance USDM Futures with $10 and a $5 VPS?**
 - What single change would have the highest impact on profitability?
+
+## Review Progress
+
+| Round | File | Questions | Status | Key Finding |
+|-------|------|-----------|--------|-------------|
+| R1 | `insight.md` | Q1-Q11 | ✅ Reviewed (Claude) | Cost/TP ratio is the #1 problem |
+| R2 | `insight_followup.md` | F1-F13 | ✅ Reviewed (Claude) | EV = -0.21%, structurally negative |
+| R3 | `insight_r3.md` | R1-R14 | ✅ Reviewed (Claude) | Simulation optimistic, sizing 2× full-Kelly |
+| R4 | `insight_r4.md` | S1-S17 | 🔄 Pending (Claude) + seeking cross-validation (Kimi, ZAI, others) | Foundation fixes + alternative strategy research |
+| Synthesis | `cross_analysis.md` | — | ✅ Created | 18 findings, 4 contradictions, go/no-go framework |
