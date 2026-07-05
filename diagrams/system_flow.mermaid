@@ -1,0 +1,84 @@
+graph TD
+    subgraph BinanceAPI["Binance API"]
+        Klines["GET /fapi/v1/klines<br/>(5m, 60 candles)"]
+        Tickers["GET /fapi/v1/ticker/24hr"]
+        Funding["GET /fapi/v1/fundingRate"]
+        Price["GET /fapi/v1/ticker/price<br/>(every 2s)"]
+    end
+
+    subgraph Scanner["Market Scanner<br/>(every 5 min)"]
+        Score["Score Markets<br/>vol(0-30) + volat(0-30) + new(0-50)"]
+        Filter["Filter: vol>$5M, change>2%"]
+        Rank["Rank & Return Top 30"]
+    end
+
+    subgraph Strategy["MemeScalp Strategy<br/>(per symbol)"]
+        Indicators["Calculate Indicators<br/>Volume Ratio, Momentum, RSI<br/>ATR%, ADX, VWAP, Funding"]
+        Regime["ADX Regime Filter<br/>ADX < 15 → SKIP"]
+        T1["Tier 1: Vol Spike + Momentum<br/>conf: 0.55-0.85"]
+        T2["Tier 2: RSI Extreme + Vol<br/>conf: 0.55-0.70"]
+        T3["Tier 3: Funding + Momentum<br/>conf: 0.55-0.75"]
+        T4["Tier 4: New Listing<br/>conf: 0.56-0.71"]
+        T5["Tier 5: Consec. Candles<br/>conf: 0.56-0.66"]
+        T6["Tier 6: High Vol + Mom<br/>conf: 0.56-0.66"]
+        T7["Tier 7: Daily Trend<br/>conf: 0.56-0.71"]
+        T8["Tier 8: VWAP + RSI<br/>conf: 0.57-0.67"]
+        Signal["Emit ScalpSignal<br/>cap conf ≤ 0.90<br/>reject if < 0.54"]
+    end
+
+    subgraph Executor["Realistic Paper Executor"]
+        EntrySim["simulate_entry()<br/>1. Min notional check<br/>2. Fill probability (97%)<br/>3. Spread calculation<br/>4. Slippage (Gaussian)<br/>5. Partial fill (8%)<br/>6. Taker fee (0.05%)"]
+        ExitSim["simulate_exit()<br/>Fill rate 99%, no partials<br/>Reversed spread direction"]
+    end
+
+    subgraph Position["Position Management<br/>(every 2s)"]
+        UpdatePrice["update_price()<br/>Calc unrealized PnL%<br/>Track max favorable/adverse<br/>Activate trailing stop"]
+        ExitCheck["should_exit()<br/>1. SL_HIT (priority 1)<br/>2. TRAILING_STOP (if ≥TP)<br/>3. TP_HIT<br/>4. MAX_HOLD"]
+        Close["close_position()<br/>SL/TP → exact trigger price<br/>Trail/Hold → simulate_exit()<br/>Calc: gross - fees = net PnL"]
+    end
+
+    subgraph Storage["Trade Database (SQLite)"]
+        TradeDB["trades table (40 columns)<br/>+ runtime_config JSON snapshot<br/>+ gross_pnl_pct / fee_impact_pct"]
+        Backtest["Backtest queries<br/>Group by runtime_config<br/>Compare config A vs B"]
+    end
+
+    subgraph Dashboard["HTTP Dashboard (:8082)"]
+        Sliders["Live Config Sliders<br/>TP%, SL%, Trail%, Sizing%<br/>Leverage, Max Positions<br/>⚡ Updates open positions too"]
+        Display["Positions, Trades<br/>Equity Curve, Stats<br/>Per-position TP/SL display"]
+    end
+
+    Tickers --> Filter --> Score --> Rank
+    Rank -->|top markets| Strategy
+    Klines --> Indicators
+    Funding --> Indicators
+
+    Indicators --> Regime
+    Regime -->|ADX ≥ 15| T1
+    Regime -->|ADX < 15| T4
+    T1 -->|no match| T2 -->|no match| T3 -->|no match| T4
+    T4 -->|no match| T5 -->|no match| T6 -->|no match| T7
+    T7 -->|no match| T8 -->|no match| Signal
+    T1 -->|match| Signal
+    T2 -->|match| Signal
+    T3 -->|match| Signal
+    T4 -->|match| Signal
+    T5 -->|match| Signal
+    T6 -->|match| Signal
+    T7 -->|match| Signal
+    T8 -->|match| Signal
+
+    Signal -->|if confidence ≥ 0.54| EntrySim
+    EntrySim -->|filled| UpdatePrice
+    EntrySim -->|rejected| Skip["Skip Trade"]
+
+    Price -->|every 2s| UpdatePrice
+    UpdatePrice --> ExitCheck
+    ExitCheck -->|SL/TP hit| Close
+    ExitCheck -->|Trail/Hold| ExitSim --> Close
+    Close --> TradeDB
+
+    TradeDB --> Backtest
+    Sliders -->|config change| Position
+    Sliders -->|new trades| EntrySim
+    Position --> Display
+    TradeDB --> Display
