@@ -322,26 +322,79 @@ These are the questions where a second (or third) independent opinion would be m
 - Meta question: pivot to measurement-first approach? (S11)
 - Side-quest: HFT scalping, swing trading, Fifteen translation, profitable bot lit review, strategy ranking, $10 viability (S12-S17)
 
-### Cross-Validation Round (Claude R4 responses + Kimi/ZAI R1 integration)
+### Cross-Validation Round (Claude R4 + ZAI R2 + Kimi R1 integration)
 
 **Key new findings:**
 
 | Finding | Detail | Impact |
 |---------|--------|--------|
 | **Breakeven WR = 54.3%** (Claude recalculation) | Using EFFECTIVE SL 0.8% (observed), not configured SL 0.5%, and NOT adding overshoot as symmetric cost | Even higher than Kimi's 51.7% — strategy is MORE dead than anyone calculated |
+| **ZAI revised position: "DEAD in current form"** | Changed from R1 "fixable" to R2 "dead, maybe alive after rebuild" after reading full sim config | Second reviewer now says dead |
+| **ZAI: real breakeven 47-52%** | Claude's 54.3% uses pure observed SL; ZAI says true live breakeven is between Claude (45.2% sim) and Kimi (51.7%) due to exit slippage not in sim | Broad agreement: 47-54% range, all above our WR |
+| **ZAI: EV likely -0.30% to -0.45%** | Even worse than Claude's -0.21% upper bound, after accounting for all optimistic sim biases | Strategy is MORE negative than previously calculated |
 | **Math error in S7** | Worst-case 3 SL hits = 3.6% bankroll (not 10.8% as we wrote — triple-counting error) | L=3/N=3/e=20% is actually safer than we thought |
 | **Leverage "red herring" = same claim** | ZAI and Claude say the same thing in different words — fee/SL ratio invariant to leverage | No real disagreement |
-| **No audited profitable crypto bot exists publicly** | Claude searched — landscape is marketing content only, no independent audit | Honest confirmation the field is barren |
+| **No audited profitable crypto bot exists publicly** | Both Claude and ZAI searched independently — landscape is marketing content only | Double-confirmed: the field is barren |
 | **Fifteen R:R >1.5:1 confirmed** | TP8/SL5 breakeven = 39.2% at 40% WR = marginal profit ✓ | Viable pivot direction |
-| **WR at wide stops = GENUINELY UNRESOLVED** | Both directions valid logically, only empirical data resolves it | Replay pipeline is THE unblocker |
-| **AND-gate + log-scale volume = compatible** | Replace linear vol_score with `min(1, log2(vol_ratio)*k)` in multiplicative formula | Combined best of Claude + ZAI proposals |
+| **WR at wide stops = GENUINELY UNRESOLVED** | All 3 reviewers agree: both directions valid logically, only empirical data resolves it | Replay pipeline is THE unblocker |
+| **AND-gate + log-scale volume = compatible** | ZAI provided complete replacement formula (Z3) combining both approaches | Concrete implementation ready |
+| **max_hold 900s too short for wide stops** | ZAI: 4% meme move takes 1-8 hours; max_hold must be 14400s+ | Current bot will hit max_hold on 60-80% of trades at TP4% |
+| **Confidence fix MUST precede widening stops** | ZAI: widening stops WITHOUT fixing confidence = amplify losses on noise trades (2.5% per noise trade vs 0.5%) | Order of operations matters |
+| **$10 bankroll = net NEGATIVE even at positive EV** | ZAI math: at +1% EV, 5 trades/month, $6 notional = $0.30/month vs $5/month VPS | Validation sandbox only, never profit phase |
+| **Realistic bankroll for "worth running": $25,000+** | Assuming $25/hr opportunity cost, 10hr/week | Honest assessment of what it takes |
+| **ZAI pushback on L=3/N=3**: $6 notional hits thinner book levels, slippage 2-3× worse | Consider L=1/N=1/e=50% ($5 notional) or accept $50-100 minimum | Even Kelly-correct sizing at $10 has execution quality issues |
 
-**Breakeven WR — The Critical Resolution:**
+**Breakeven WR — The Critical Resolution (3 Reviewer Views):**
 
-| Method | Breakeven WR | Who | Correct? |
-|--------|-------------|------|----------|
-| Config SL 0.5%, no overshoot | 45.2% | Claude R2, ZAI | Understates real SL impact |
+| Method | Breakeven WR | Who | Assessment |
+|--------|-------------|------|------------|
+| Config SL 0.5%, no overshoot (sim assumptions) | 45.2% | Claude R2, ZAI R1 | Understates real SL impact |
 | Config SL 0.5%, overshoot as symmetric cost | 51.7% | Kimi | Overshoot isn't symmetric (doesn't affect TP) |
-| **Effective SL 0.8%, no symmetric overshoot** | **54.3%** | **Claude R4 recalc** | **Most accurate — uses observed SL exit** |
+| **Effective SL 0.8%, no symmetric overshoot** | **54.3%** | **Claude R4** | Most accurate using observed data |
+| **True live breakeven (with exit slippage + fat tails)** | **47-52%** | **ZAI R2** | Best range estimate for reality |
+| Observed typical net loss 0.78% | ~45.1% | ZAI R2 calc | Only if sim's zero-exit-slippage holds |
 
-**Conclusion**: The true breakeven WR at current parameters is **54.3%**. Our actual WR is 35-45%. The gap is 9-19 percentage points. The strategy is not just negative EV — it's deeply, structurally negative.
+**Conclusion**: The true breakeven WR at current parameters is **47-54%** depending on execution realism. Our actual WR is 35-45%. The gap is **at minimum 2-19 percentage points**. Even the most generous estimate puts us at borderline dead. The strategy is deeply, structurally negative.
+
+---
+
+## 11. Consensus Strategy Rankings (All 3 Reviewers)
+
+Based on ZAI's detailed strategy comparison (the most concrete of all reviewers) + Claude's and Kimi's directional inputs:
+
+| Strategy Class | Timeframe | Est. EV/trade | Cost/TP | Viability at $10 | Min Capital to Profit |
+|---------------|-----------|---------------|---------|-------------------|----------------------|
+| Meme scalp (current) | 1-15min | **-0.21%** | 17.8% | DEAD | Never (negative EV) |
+| Meme scalp (wide rebuild) | 5-30min | +0.05-0.30% | 4.5% | Validation only | $235 |
+| Meme swing | 1-8hr | +0.20-0.50% | 3.6% | Validation only | ~$200 |
+| **Major swing (Fifteen-style)** | **4hr-1day** | **+0.75-1.40%** | **1.25%** | **Validation only** | **$680** |
+| Major mean-reversion | 1-4hr | +0.30-0.80% | 3.3% | Validation only | ~$500 |
+| Funding + momentum | 4-8hr | +0.20-0.50% | 2.5% | Validation only | $1,300 |
+| Funding capture alone | 8hr | +0.05-0.15% | varies | No | $100+ |
+| Major HFT scalp | 1-5min | -0.10% | 4-8% | DEAD | $10k+ infra |
+
+**Best pivot**: Major Swing (Fifteen-style on BTC/ETH/SOL) — direct port of proven strategy, best cost/TP ratio, works on current infrastructure.
+
+---
+
+## 12. Actionable Next Steps (All Reviewers Converge)
+
+**STOP doing:**
+1. Stop optimizing parameters blind (all 3 reviewers agree)
+2. Stop asking AIs to predict WR — only measurement works (ZAI, Claude agree)
+3. Stop adding tiers/filters/indicators — enough complexity (ZAI)
+4. Stop trading live with known-dead strategy (ZAI)
+
+**START doing (in order):**
+
+| Step | Action | Duration | Gate |
+|------|--------|----------|------|
+| 1 | **Build replay pipeline** (1m klines, conservative SL-first, TP/SL grid search, per-tier WR, MFE/MAE) | 3-5 days | Replay validates sim within ±5% WR |
+| 2 | **Run replay on ~400 trades** (200 existing + 200 historical) | 1 day | At least one {TP,SL} combo shows WR > BE + 5%. If none → pivot to Major Swing |
+| 3 | **Calibrate sim with small live test** ($20-50, 30-50 trades) | 1-2 weeks | Sim PnL within 20% of live PnL |
+| 4 | **Fix confidence formula** (ZAI's Z3 spec: log-scale vol + AND-gate + 0.3% momentum floor) | 1 day | Replay shows WR improvement >3% |
+| 5 | **Fix Kelly sizing** (N×e×L ≤ 2.0) + widen stops to validated combo | 1 hour | Max drawdown in replay < 25% |
+| 6 | **Forward test 2 weeks** at new params | 2 weeks | Forward WR within 5% of replay WR |
+| 7 | **Decide**: scale up or pivot to Major Swing | — | Based on steps 2-6 results |
+
+**Critical order-of-operations insight from ZAI**: Fix confidence formula (#4) BEFORE widening stops (#5). Wide stops + bad signals = amplified losses. Kill noise signals first, then give surviving signals room to breathe.
