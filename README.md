@@ -40,7 +40,7 @@ This is NOT a runnable bot. It is a **review artifact** containing:
 |--------|---------|
 | **Market** | Binance USDM Futures (perpetual contracts) |
 | **Strategy** | Meme-cap scalping with 8-tier signal priority |
-| **Timeframe** | 5-minute klines (configurable) |
+| **Timeframe** | 1-minute klines (configurable; was 5m) |
 | **Position Mode** | Isolated margin, 20x leverage default |
 | **Entry** | Volume spike + momentum + regime filter (ADX) |
 | **Exit** | Fixed TP/SL, trailing stop, max hold time |
