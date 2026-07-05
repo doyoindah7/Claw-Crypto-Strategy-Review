@@ -102,5 +102,9 @@ This is NOT a runnable bot. It is a **review artifact** containing:
 | R1 | `insight.md` | Q1-Q11 | ✅ Reviewed (Claude) | Cost/TP ratio is the #1 problem |
 | R2 | `insight_followup.md` | F1-F13 | ✅ Reviewed (Claude) | EV = -0.21%, structurally negative |
 | R3 | `insight_r3.md` | R1-R14 | ✅ Reviewed (Claude) | Simulation optimistic, sizing 2× full-Kelly |
-| R4 | `insight_r4.md` | S1-S17 | 🔄 Pending (Claude) + seeking cross-validation (Kimi, ZAI, others) | Foundation fixes + alternative strategy research |
-| Synthesis | `cross_analysis.md` | — | ✅ Created | 18 findings, 4 contradictions, go/no-go framework |
+| R4 | `insight_r4.md` | S1-S17 | ✅ Reviewed (Claude R4) | Foundation fixes + alternative strategy research |
+| Cross-val | `review_kimi_zai.md` | K1-K6, Z1-Z6, X1-X5 | ✅ ZAI extended response received | Breakeven 47-52%, confidence Z3, strategy rankings |
+| Cross-val | `followup_claude.md` | C1-C6 | ✅ Claude R4 response integrated | Breakeven 54.3%, math error S7, no audited profitable bot |
+| Synthesis | `cross_analysis.md` | — | ✅ Complete | 18 findings, 4 contradictions, go/no-go framework, FINAL VERDICT: strategy DEAD |
+
+**Review Phase: COMPLETE (2025-07-05)** — 3 reviewers, 4 rounds, 55+ questions answered. Moving to implementation: replay pipeline.

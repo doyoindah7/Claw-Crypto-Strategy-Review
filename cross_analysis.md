@@ -398,3 +398,79 @@ Based on ZAI's detailed strategy comparison (the most concrete of all reviewers)
 | 7 | **Decide**: scale up or pivot to Major Swing | — | Based on steps 2-6 results |
 
 **Critical order-of-operations insight from ZAI**: Fix confidence formula (#4) BEFORE widening stops (#5). Wide stops + bad signals = amplified losses. Kill noise signals first, then give surviving signals room to breathe.
+
+---
+
+## 13. Review Phase — Final Status
+
+> **Date**: 2025-07-05 — Review phase declared COMPLETE. Moving to implementation.
+
+### 13.1 Reviewer Participation Summary
+
+| Reviewer | Rounds Completed | Questions Answered | Follow-up Status |
+|----------|-----------------|-------------------|------------------|
+| Claude | R1–R4 (full) | 55 questions (Q1-Q11, F1-F13, R1-R14, S1-S17) | Complete — no more follow-up possible |
+| ZAI | R1 + Extended (Z1-Z6, X1-X5) | ~30 questions + detailed specs | Extended response received with implementation offer |
+| Kimi | R1 only | 11 questions | No response to K1-K6 follow-up — GHOSTED |
+
+### 13.2 Final Verdict (3-Reviewer Consensus)
+
+**The current strategy (8-tier meme scalp, TP1%/SL0.5%, 20x leverage) is DEAD.**
+
+| Dimension | Consensus | Confidence |
+|-----------|-----------|------------|
+| Current strategy viability | **DEAD** — EV -0.21% to -0.45%, breakeven 47-54% vs WR 35-45% | **Unanimous** |
+| Root cause | Cost/TP ratio 17.8% (vs 3.1% benchmark), tight stops in high-ATR environment | **Unanimous** |
+| Simulation trust | **NOT trustworthy** — systematically optimistic | **Unanimous** |
+| WR at wide stops | **Unknown** — only replay can resolve | **Unanimous** |
+| Best pivot candidate | **Major Swing (Fifteen-style)** on BTC/ETH/SOL | **2 of 3 (Claude + ZAI)** |
+| $10 bankroll role | **Validation sandbox only** — cannot generate meaningful profit | **Unanimous** |
+| Minimum capital to profit | $680 (Major Swing), $5,000+ (worth your time) | **ZAI (most detailed)** |
+| #1 priority action | **Build replay pipeline** — unblocks ALL decisions | **Unanimous** |
+
+### 13.3 Key Implementation Specs Collected
+
+**Confidence Formula (ZAI Z3 — AND-gate + log-scale volume):**
+```python
+vol_score = min(1.0, math.log2(max(1.0, vol_ratio)) / 3.0)
+mom_score = max(0.0, min(1.0, (abs(momentum_pct) - 0.3) / 0.7))
+confidence = 0.40 + 0.45 * (vol_score * mom_score)
+THRESHOLD = 0.55
+```
+
+**Replay Pipeline Spec (ZAI + Claude consensus):**
+- Source: 1m klines from Binance REST API (`/fapi/v1/klines`)
+- 240 candles/call, ~200 trades × 4hr window = ~1 API call per trade (trivial)
+- Ambiguous candles (high > TP AND low < SL): assume SL hit first (conservative)
+- Calibration gate: replay WR must match sim observed WR within ±5%
+- Sample size: 379 trades for ±5% CI
+- Output: per-trade CSV with columns: {symbol, side, entry_time, entry_price, tier, confidence, exit_type, exit_price, pnl_pct}
+
+**ADX Fix Priority (ZAI):**
+1. Momentum threshold >0.3% (most impactful)
+2. ADX >22 (up from 15)
+3. DI+ vs DI- separation >10
+4. ADX rising (slope >0 over 3 bars)
+
+**Hold Time at Wide Stops (ZAI):**
+- 4% moves on liquid memes: 1-3 hours
+- 4% moves on new listings: 15-45 minutes
+- 4% moves on mid-cap memes: 2-6 hours
+- **max_hold must increase from 900s (15min) to 14400s (4hr) minimum**
+
+**Major Swing (Fifteen-style) — Best Pivot Spec:**
+- Instruments: BTC/ETH/SOL perpetuals
+- Timeframe: 4hr klines
+- Entry: EMA20/50 crossover + ROC + ADX>25
+- TP 8% / SL 5% (R:R 1.6:1, breakeven 39.2%)
+- Leverage: 3x
+- Expected EV: +0.75-1.40% per trade
+- Cost/TP: 1.25% (best of all strategies evaluated)
+
+### 13.4 Transition to Implementation
+
+**Review phase conclusions are STABLE** — 4 rounds of analysis from 3 independent reviewers have converged. More analysis will NOT change the core findings. The bottleneck is now CODE, not analysis.
+
+**Next phase**: Build replay pipeline → validate WR at wide stops → decide: fix current strategy or pivot to Major Swing.
+
+See implementation plan in this repo or separate implementation repository.
