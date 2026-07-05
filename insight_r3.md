@@ -104,10 +104,98 @@ This changes ALL tier confidence calculations. Currently each tier has its own f
 
 ---
 
-## Data Available
+## Paper Trading Environment — Is Our Simulation Realistic?
 
-Same as before (see `data/PERFORMANCE_METRICS.md`). New addition from Round 2 analysis:
-- **Current EV per trade: -0.21%** (structurally negative)
-- **Breakeven WR at TP3%/SL2%: ~44%**
-- **Estimated WR at TP3%/SL2%: 38-45%** (needs replay validation)
-- **Minimum bankroll for $1/day profit: ~$1000** (zero-leverage Fifteen-style)
+Before we trust any metric from this system, you need to know EXACTLY how our paper bot simulates reality. **Review this setup and tell us: where is our simulation too optimistic? Where is it too pessimistic? What specific changes would make it more realistic?**
+
+### Infrastructure
+
+| Component | Setup |
+|-----------|-------|
+| Runtime | Python 3.x, single-process, **synchronous** (no asyncio) |
+| VPS | $5 VPS, runs via systemd (`claw-realistic` service) |
+| Threading | Main loop (bot) + 1 daemon thread (HTTP dashboard) |
+| State sharing | No locks — dashboard slider writes can race with main loop reads |
+| Crash recovery | **None for open positions** — only closed trades persist to SQLite |
+
+### Price Feed
+
+| Aspect | Implementation |
+|--------|---------------|
+| Source | Binance REST API (`/fapi/v1/ticker/price`) |
+| Polling interval | **2 seconds** (hardcoded in main loop) |
+| Kline source | `/fapi/v1/klines` (5m interval, 60 candles per fetch) |
+| WebSocket | **Not used** |
+| Order book | **Not used** — spread is simulated, not read from L2 data |
+| Rate limit | 50ms min between requests, monitor weight header |
+
+### Execution Simulation (Entry)
+
+```
+Order → Min Notional Check ($5) → Fill Probability (97%) →
+Apply Spread → Add Slippage → Partial Fill Check (8%) → Fee
+```
+
+| Parameter | Value | Our Concern |
+|-----------|-------|-------------|
+| Base spread | 5 bps | Too low for some meme coins? |
+| Meme multiplier | 2.5× (→ 12.5 bps) | Fixed — doesn't vary with time/vol |
+| New listing multiplier | 2.0× on top of meme (→ 25 bps) | |
+| Slippage model | Gaussian(μ=1.5, σ=1.0) bps, **cap 5 bps** | **Way too tame?** Real meme slippage can be 10-50+ bps during volatility |
+| Fill probability | 97% (3% rejected) | Accurate? |
+| Partial fill | 8% chance, 60-99% fill ratio | Entry only — exit always fills 100% |
+| Fee | 0.05% taker per side | Accurate (Binance USDM standard) |
+| Latency simulation | Gaussian(μ=8ms, σ=4ms), min 2ms | **Not applied to price** — only logged, doesn't shift fill price |
+
+### Execution Simulation (Exit) — TWO MODES
+
+**Mode 1: SL/TP Hit (stop-limit simulation)**
+- Exit at **exact trigger price** — no spread, no slippage
+- Fee: 0.05% taker
+- Rationale: simulates exchange stop-limit order
+- **CRITICAL CONCERN**: In reality, stop-limit can **fail to fill** if price gaps through. We never model this. Also, we're not using stop-limit on exchange — we're polling and checking in software, so the "exact trigger price" assumption may be wrong.
+
+**Mode 2: Max Hold / Trailing Stop (market order simulation)**
+- Full spread + slippage + fee
+- Exit fill probability: 99%
+- No partial fills on exit
+- This is more realistic
+
+### SL Overshoot Handling
+
+Our SL check runs every 2 seconds. We check `current_price` against SL level. If price has moved past SL between checks:
+- We close at `current_price`, NOT at the SL trigger price
+- This creates the observed overshoot: SL 0.5% → actual exits at 0.72%, 0.82%, 1.60%
+- **We do NOT use kline high/low to detect intra-poll wicks** — only current_price
+
+### What We KNOW Is Wrong
+
+1. **Slippage model too tame**: Gaussian capped at 5 bps. Real meme slippage during dumps is 10-50+ bps. This makes our cost model **optimistic**.
+2. **Spread is static**: 5 bps × 2.5 for memes. Real spread varies by time of day, volatility, and liquidity. Sometimes wider, sometimes narrower.
+3. **SL/TP exits have zero slippage**: We assume stop-limit fills exactly at trigger. In reality, stop-market (which we should use) has slippage, and stop-limit can fail to fill.
+4. **No latency impact on price**: We simulate latency timing but don't use it to shift fill price. Real market orders execute after network delay — price may have moved.
+5. **No order book depth**: We can't detect thin liquidity, spoofing, or book imbalances.
+6. **Exit partial fills ignored**: We assume 100% fill on exit. In reality, large positions in illiquid markets can get partial fills.
+7. **Rejection reasons are random**: Our 3% rejection picks random reasons. In reality, rejections correlate with market conditions (more likely during high volatility).
+8. **No correlation between positions**: 5 concurrent LONG meme positions can all crash together. Our PnL treats them as independent.
+
+### What We Think Is Correct
+
+1. **Taker fee 0.05% per side**: Matches Binance USDM standard tier
+2. **Spread direction logic**: LONG fills at ASK, SHORT fills at BID (correct)
+3. **PnL decomposition**: We separately track gross_pnl, fee_impact, and net_pnl
+4. **Runtime config snapshots**: Every trade records the SL/TP/sizing AT OPEN TIME, not current slider value
+5. **Minimum notional enforcement**: $5 Binance minimum checked on every entry
+6. **Fill probability independent of order size**: Should probably scale with notional
+
+### R14. The Realism Audit
+
+**Given the full environment description above, rate each simulation aspect on a scale: OPTIMISTIC / REALISTIC / PESSIMISTIC. For each OPTIMISTIC item, quantify how much it inflates our win rate or underestimates our costs. Specifically:**
+
+1. **Slippage cap at 5 bps**: How much does this underestimate real slippage on meme coins? What's a more realistic distribution?
+2. **Zero slippage on SL/TP exits**: We're assuming stop-limit fills perfectly. You said use stop-market. If we switch to stop-market, what slippage should we add to SL exits?
+3. **Static spread**: How much does real spread vary? Should we fetch live bid-ask?
+4. **No latency price impact**: How much does 50-200ms real-world latency actually cost on a 2s polling bot?
+5. **Independent position PnL**: If 5 meme LONGs crash together 30% of the time, how does that change our ruin probability?
+
+**Bottom line: is our paper trading environment trustworthy enough for the metrics we're using to make decisions? Or are we making decisions based on inflated numbers?**
