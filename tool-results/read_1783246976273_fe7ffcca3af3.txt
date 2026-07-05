@@ -1,0 +1,1636 @@
+     1→     1→"""
+     2→     2→Claw-Crypto Binance Futures Bot — REALISTIC Paper Trading Mode
+     3→     3→
+     4→     4→Key improvements over naive paper trading:
+     5→     5→- Spread simulation: entry fills at ASK (LONG) / BID (SHORT), not mid price
+     6→     6→- Slippage simulation: random adverse price movement on market orders
+     7→     7→- Fill probability: ~3% of orders get rejected (like live)
+     8→     8→- Minimum notional enforcement: $5 Binance minimum
+     9→     9→- Partial fills: 8% chance of partial fill
+    10→    10→- Taker fee: 0.05% per side (0.10% round-trip), NOT maker fee
+    11→    11→- Faster price polling: 2s instead of 5s for better TP/SL monitoring
+    12→    12→- Execution stats tracked separately
+    13→    13→
+    14→    14→This makes paper results much closer to live trading reality.
+    15→    15→If the bot can't profit in realistic paper mode, it won't profit in live.
+    16→    16→"""
+    17→    17→
+    18→    18→import time
+    19→    19→import yaml
+    20→    20→import json
+    21→    21→import logging
+    22→    22→import threading
+    23→    23→import random
+    24→    24→from dataclasses import dataclass, field
+    25→    25→from http.server import HTTPServer, BaseHTTPRequestHandler
+    26→    26→from typing import Optional
+    27→    27→from datetime import datetime, timezone
+    28→    28→
+    29→    29→try:
+    30→    30→    # Package imports (when running inside Claw-Crypto project)
+    31→    31→    from claw_crypto.binance.client import BinanceFuturesClient
+    32→    32→    from claw_crypto.binance.scanner import BinanceFuturesScanner, ScannedMarket
+    33→    33→    from claw_crypto.binance.strategy import MemeScalpStrategy, ScalpSignal
+    34→    34→    from claw_crypto.binance.realistic_executor import RealisticPaperExecutor
+    35→    35→    from claw_crypto.binance.trade_db import TradeDB
+    36→    36→except ImportError:
+    37→    37→    # Direct imports (when running standalone from scripts/ dir)
+    38→    38→    from binance_futures import BinanceFuturesClient
+    39→    39→    from market_scanner import BinanceFuturesScanner, ScannedMarket
+    40→    40→    from meme_scalp import MemeScalpStrategy, ScalpSignal
+    41→    41→    from realistic_executor import RealisticPaperExecutor
+    42→    42→
+    43→    43→log = logging.getLogger("claw_binance")
+    44→    44→
+    45→    45→# ─── Realistic Paper Position ───────────────────────────────
+    46→    46→
+    47→    47→
+    48→    48→@dataclass
+    49→    49→class PaperPosition:
+    50→    50→    """A paper trading position with realistic execution details."""
+    51→    51→    symbol: str
+    52→    52→    side: str            # "LONG" or "SHORT"
+    53→    53→    entry_price: float   # Actual fill price (includes spread + slippage)
+    54→    54→    mid_price: float     # Mid price at signal time (for comparison)
+    55→    55→    quantity: float       # Number of contracts
+    56→    56→    notional_usd: float   # Actual notional filled (may be < intended for partial fills)
+    57→    57→    margin_usd: float     # Margin used
+    58→    58→    leverage: int
+    59→    59→    invested_at: float    # Unix timestamp
+    60→    60→    take_profit_pct: float
+    61→    61→    stop_loss_pct: float
+    62→    62→    trailing_stop_pct: float
+    63→    63→    trailing_activation_pct: float
+    64→    64→    max_hold_sec: int
+    65→    65→
+    66→    66→    # Execution details (NEW — realistic paper)
+    67→    67→    spread_cost_usd: float = 0.0
+    68→    68→    entry_slippage_bps: float = 0.0
+    69→    69→    entry_fee_usd: float = 0.0
+    70→    70→    fill_qty_ratio: float = 1.0
+    71→    71→    intended_notional_usd: float = 0.0  # What we wanted vs what we got
+    72→    72→    is_partial_fill: bool = False
+    73→    73→    is_new_listing: bool = False
+    74→    74→
+    75→    75→    # Live tracking
+    76→    76→    current_price: float = 0.0
+    77→    77→    unrealized_pnl: float = 0.0
+    78→    78→    unrealized_pnl_pct: float = 0.0
+    79→    79→    highest_pnl_pct: float = 0.0
+    80→    80→    trailing_active: bool = False
+    81→    81→    trailing_stop_price: float = 0.0
+    82→    82→    exit_reason: str = ""
+    83→    83→    confidence: float = 0.0
+    84→    84→    signal_reason: str = ""
+    85→    85→    volume_ratio: float = 0.0
+    86→    86→    momentum_pct: float = 0.0
+    87→    87→    rsi: float = 50.0
+    88→    88→
+    89→    89→    # Signal accuracy tracking
+    90→    90→    max_favorable_pct: float = 0.0
+    91→    91→    max_adverse_pct: float = 0.0
+    92→    92→    tp_would_hit: bool = False
+    93→    93→    sl_would_hit: bool = False
+    94→    94→    price_updates: int = 0
+    95→    95→
+    96→    96→    def update_price(self, current_price: float):
+    97→    97→        """Update position with current price and track signal accuracy."""
+    98→    98→        self.current_price = current_price
+    99→    99→        self.price_updates += 1
+   100→   100→
+   101→   101→        if self.side == "LONG":
+   102→   102→            self.unrealized_pnl_pct = (current_price - self.entry_price) / self.entry_price * 100
+   103→   103→        else:  # SHORT
+   104→   104→            self.unrealized_pnl_pct = (self.entry_price - current_price) / self.entry_price * 100
+   105→   105→
+   106→   106→        self.unrealized_pnl = self.margin_usd * self.leverage * (self.unrealized_pnl_pct / 100)
+   107→   107→
+   108→   108→        # Track highest PnL for trailing stop
+   109→   109→        if self.unrealized_pnl_pct > self.highest_pnl_pct:
+   110→   110→            self.highest_pnl_pct = self.unrealized_pnl_pct
+   111→   111→
+   112→   112→        # Signal accuracy tracking
+   113→   113→        if self.unrealized_pnl_pct > self.max_favorable_pct:
+   114→   114→            self.max_favorable_pct = self.unrealized_pnl_pct
+   115→   115→        if self.unrealized_pnl_pct < self.max_adverse_pct:
+   116→   116→            self.max_adverse_pct = self.unrealized_pnl_pct
+   117→   117→
+   118→   118→        # Check if TP/SL WOULD have been hit
+   119→   119→        if self.unrealized_pnl_pct >= self.take_profit_pct:
+   120→   120→            self.tp_would_hit = True
+   121→   121→        if self.unrealized_pnl_pct <= -self.stop_loss_pct:
+   122→   122→            self.sl_would_hit = True
+   123→   123→
+   124→   124→        # Activate trailing stop
+   125→   125→        if self.unrealized_pnl_pct >= self.trailing_activation_pct and not self.trailing_active:
+   126→   126→            self.trailing_active = True
+   127→   127→
+   128→   128→        # Update trailing stop price
+   129→   129→        if self.trailing_active:
+   130→   130→            if self.side == "LONG":
+   131→   131→                self.trailing_stop_price = self.entry_price * (1 + (self.highest_pnl_pct - self.trailing_stop_pct) / 100)
+   132→   132→            else:
+   133→   133→                self.trailing_stop_price = self.entry_price * (1 - (self.highest_pnl_pct - self.trailing_stop_pct) / 100)
+   134→   134→
+   135→   135→    def should_exit(self) -> Optional[str]:
+   136→   136→        """Check if position should be closed. Returns exit reason or None."""
+   137→   137→        if self.unrealized_pnl_pct == 0:
+   138→   138→            return None
+   139→   139→
+   140→   140→        # Stop loss — always checked first, highest priority
+   141→   141→        if self.unrealized_pnl_pct <= -self.stop_loss_pct:
+   142→   142→            return "SL_HIT"
+   143→   143→
+   144→   144→        # Trailing stop — only exits if it locks in profit AT OR ABOVE TP level.
+   145→   145→        # This prevents trailing stop from exiting below TP (which would be worse
+   146→   146→        # than just taking the fixed TP).
+   147→   147→        # Example: TP=1.0%, trail_act=0.5%, trail=0.3%
+   148→   148→        #   Profit reaches 0.5% → trailing activates
+   149→   149→        #   Profit goes to 0.8%, drops to 0.5% → trail_exit=0.5% < 1% → NO exit, let TP handle
+   150→   150→        #   Profit reaches 1.3% → trail_exit=1.0% >= 1% → if drops below 1.0%, TRAILING_STOP
+   151→   151→        #   Profit reaches 2.0% → trail_exit=1.7% → if drops below 1.7%, TRAILING_STOP at 1.7%
+   152→   152→        if self.trailing_active:
+   153→   153→            trail_exit_level = self.highest_pnl_pct - self.trailing_stop_pct
+   154→   154→            if trail_exit_level >= self.take_profit_pct:
+   155→   155→                # Trail level is above TP — safe to use trailing stop
+   156→   156→                if self.unrealized_pnl_pct < trail_exit_level:
+   157→   157→                    return "TRAILING_STOP"
+   158→   158→            # If trail level is still below TP, fall through to TP check below
+   159→   159→
+   160→   160→        # Take profit — always checked (even when trailing is active but trail level < TP)
+   161→   161→        if self.unrealized_pnl_pct >= self.take_profit_pct:
+   162→   162→            return "TP_HIT"
+   163→   163→
+   164→   164→        # Max hold time
+   165→   165→        held_sec = time.time() - self.invested_at
+   166→   166→        if held_sec >= self.max_hold_sec:
+   167→   167→            return "MAX_HOLD"
+   168→   168→
+   169→   169→        return None
+   170→   170→
+   171→   171→
+   172→   172→@dataclass
+   173→   173→class TradeRecord:
+   174→   174→    """Record of a completed trade with realistic execution details."""
+   175→   175→    symbol: str
+   176→   176→    side: str
+   177→   177→    entry_price: float
+   178→   178→    exit_price: float
+   179→   179→    leverage: int
+   180→   180→    margin_usd: float
+   181→   181→    notional_usd: float
+   182→   182→    pnl_usd: float
+   183→   183→    pnl_pct: float
+   184→   184→    hold_sec: float
+   185→   185→    exit_reason: str
+   186→   186→    confidence: float
+   187→   187→    signal_reason: str
+   188→   188→    timestamp: float
+   189→   189→    # Realistic execution details
+   190→   190→    mid_price_entry: float = 0.0
+   191→   191→    spread_cost_usd: float = 0.0
+   192→   192→    entry_slippage_bps: float = 0.0
+   193→   193→    exit_slippage_bps: float = 0.0
+   194→   194→    entry_fee_usd: float = 0.0
+   195→   195→    exit_fee_usd: float = 0.0
+   196→   196→    total_fees_usd: float = 0.0
+   197→   197→    fill_qty_ratio: float = 1.0
+   198→   198→    is_partial_fill: bool = False
+   199→   199→    # Signal accuracy
+   200→   200→    max_favorable_pct: float = 0.0
+   201→   201→    max_adverse_pct: float = 0.0
+   202→   202→    tp_would_hit: bool = False
+   203→   203→    sl_would_hit: bool = False
+   204→   204→    price_updates: int = 0
+   205→   205→
+   206→   206→
+   207→   207→@dataclass
+   208→   208→class BotState:
+   209→   209→    """Bot state for Binance Futures realistic paper trading."""
+   210→   210→    balance_usd: float
+   211→   211→    open_positions: list = field(default_factory=list)
+   212→   212→    trade_history: list = field(default_factory=list)
+   213→   213→    equity_history: list = field(default_factory=list)
+   214→   214→    scan_result: Optional[object] = None
+   215→   215→    last_scan_time: float = 0.0
+   216→   216→    cycle_count: int = 0
+   217→   217→    start_time: float = 0.0
+   218→   218→    total_pnl: float = 0.0
+   219→   219→    total_fees: float = 0.0
+   220→   220→    total_spread_cost: float = 0.0
+   221→   221→    total_slippage_cost: float = 0.0
+   222→   222→    rejected_orders: int = 0
+   223→   223→    wins: int = 0
+   224→   224→    losses: int = 0
+   225→   225→
+   226→   226→
+   227→   227→# ─── Main Bot ─────────────────────────────────────────────
+   228→   228→
+   229→   229→
+   230→   230→class BinanceFuturesBotRealistic:
+   231→   231→    """Main bot class — scanner + strategy + REALISTIC paper trading loop."""
+   232→   232→
+   233→   233→    def __init__(self, config_path: str = "binance_config_realistic.yaml"):
+   234→   234→        # Load config
+   235→   235→        with open(config_path, "r") as f:
+   236→   236→            self.config = yaml.safe_load(f)
+   237→   237→
+   238→   238→        bot_cfg = self.config.get("bot", {})
+   239→   239→        api_cfg = self.config.get("api", {})
+   240→   240→        scanner_cfg = self.config.get("scanner", {})
+   241→   241→        strategy_cfg = self.config.get("strategy", {})
+   242→   242→        executor_cfg = self.config.get("executor", {})
+   243→   243→
+   244→   244→        self.bot_name = bot_cfg.get("name", "Claw-Binance-Realistic")
+   245→   245→        self.initial_balance = bot_cfg.get("initial_balance_usd", 10.0)
+   246→   246→
+   247→   247→        # Initialize components
+   248→   248→        self.client = BinanceFuturesClient(
+   249→   249→            base_url=api_cfg.get("base_url", "https://fapi.binance.com"),
+   250→   250→            timeout=api_cfg.get("timeout_sec", 10),
+   251→   251→            max_retries=api_cfg.get("max_retries", 3),
+   252→   252→        )
+   253→   253→
+   254→   254→        self.scanner = BinanceFuturesScanner(self.client, scanner_cfg)
+   255→   255→        self.strategy = MemeScalpStrategy(self.client, strategy_cfg)
+   256→   256→        self.executor = RealisticPaperExecutor(executor_cfg)
+   257→   257→
+   258→   258→        # Bot state
+   259→   259→        self.state = BotState(
+   260→   260→            balance_usd=self.initial_balance,
+   261→   261→            start_time=time.time(),
+   262→   262→        )
+   263→   263→
+   264→   264→        # Timing — FASTER polling for better TP/SL detection
+   265→   265→        self.scan_interval = scanner_cfg.get("refresh_sec", 300)
+   266→   266→        self.strategy_interval = strategy_cfg.get("cooldown_sec", 15)
+   267→   267→        self.cycle_interval = 5    # Main loop every 5s
+   268→   268→        self.price_update_interval = 2  # Update prices every 2s (was 5s)
+   269→   269→
+   270→   270→        # Dashboard
+   271→   271→        self.dashboard_cfg = self.config.get("dashboard", {})
+   272→   272→        self.dashboard_port = self.dashboard_cfg.get("port", 8081)
+   273→   273→
+   274→   274→        # Runtime config — what the dashboard sliders control
+   275→   275→        self._runtime_tp = strategy_cfg.get("take_profit_pct", 0.8)
+   276→   276→        self._runtime_sl = strategy_cfg.get("stop_loss_pct", 0.7)
+   277→   277→        self._runtime_max_hold = strategy_cfg.get("max_hold_sec", 240)
+   278→   278→        self._runtime_trail = strategy_cfg.get("trailing_stop_pct", 0.25)
+   279→   279→        self._runtime_trail_act = strategy_cfg.get("trailing_activation_pct", 0.50)
+   280→   280→        self._runtime_max_pos = strategy_cfg.get("max_positions", 5)
+   281→   281→        self._runtime_sizing = strategy_cfg.get("sizing_pct", 0.20)
+   282→   282→        self._runtime_min_margin_pct = strategy_cfg.get("min_margin_pct", 0.15)
+   283→   283→        self._runtime_leverage = strategy_cfg.get("leverage", 20)
+   284→   284→
+   285→   285→        # Running flag
+   286→   286→        self._running = False
+   287→   287→        self._max_drawdown_pct = 50
+   288→   288→
+   289→   289→        # Trade database — persistent storage with runtime config snapshots
+   290→   290→        try:
+   291→   291→            self.db = TradeDB("claw_trades.db")
+   292→   292→            log.info(f"TradeDB initialized (session: {self.db.session_id})")
+   293→   293→        except Exception as e:
+   294→   294→            log.warning(f"TradeDB init failed: {e}, trades won't be persisted")
+   295→   295→            self.db = None
+   296→   296→
+   297→   297→        log.info(f"Bot initialized: {self.bot_name} (REALISTIC PAPER MODE)")
+   298→   298→        log.info(f"  Balance: ${self.initial_balance}")
+   299→   299→        log.info(f"  Leverage: {strategy_cfg.get('leverage', 20)}x (default)")
+   300→   300→        log.info(f"  Taker fee: {self.executor.taker_fee_pct}% per side")
+   301→   301→        log.info(f"  Min notional: ${self.executor.min_notional_usd}")
+   302→   302→        log.info(f"  Spread: {self.executor.spread_bps} bps")
+   303→   303→        log.info(f"  Price polling: {self.price_update_interval}s")
+   304→   304→
+   305→   305→    def run(self):
+   306→   306→        """Main bot loop."""
+   307→   307→        self._running = True
+   308→   308→        log.info(f"🚀 {self.bot_name} starting (REALISTIC PAPER MODE)...")
+   309→   309→        log.info(f"  Max drawdown stop: -{self._max_drawdown_pct}%")
+   310→   310→
+   311→   311→        # Start dashboard API in background thread
+   312→   312→        self._start_dashboard()
+   313→   313→
+   314→   314→        # Initial scan
+   315→   315→        log.info("Running initial market scan...")
+   316→   316→        self._run_scan()
+   317→   317→
+   318→   318→        last_scan = time.time()
+   319→   319→        last_strategy = time.time()
+   320→   320→        last_price_update = time.time()
+   321→   321→
+   322→   322→        while self._running:
+   323→   323→            try:
+   324→   324→                now = time.time()
+   325→   325→                self.state.cycle_count += 1
+   326→   326→
+   327→   327→                # 1. Re-scan markets periodically
+   328→   328→                if now - last_scan >= self.scan_interval:
+   329→   329→                    self._run_scan()
+   330→   330→                    last_scan = now
+   331→   331→
+   332→   332→                # 2. Update prices for open positions (FASTER: every 2s)
+   333→   333→                if now - last_price_update >= self.price_update_interval:
+   334→   334→                    self._update_positions()
+   335→   335→                    last_price_update = now
+   336→   336→
+   337→   337→                # 3. Evaluate strategy on top symbols
+   338→   338→                if now - last_strategy >= self.strategy_interval:
+   339→   339→                    margin_dep = sum(p.margin_usd for p in self.state.open_positions)
+   340→   340→                    unreal = sum(p.unrealized_pnl for p in self.state.open_positions)
+   341→   341→                    equity = self.state.balance_usd + margin_dep + unreal
+   342→   342→                    drawdown_pct = (1 - equity / self.initial_balance) * 100
+   343→   343→
+   344→   344→                    if drawdown_pct >= self._max_drawdown_pct:
+   345→   345→                        if self.state.cycle_count % 12 == 0:
+   346→   346→                            log.warning(f"⛔ MAX DRAWDOWN: -{drawdown_pct:.1f}% exceeds -{self._max_drawdown_pct}%. Pausing new trades.")
+   347→   347→                    else:
+   348→   348→                        self._evaluate_signals()
+   349→   349→                    last_strategy = now
+   350→   350→
+   351→   351→                # 4. Record equity
+   352→   352→                self._record_equity()
+   353→   353→
+   354→   354→                # 5. Log status every 60s
+   355→   355→                if self.state.cycle_count % 12 == 0:
+   356→   356→                    self._log_status()
+   357→   357→
+   358→   358→                time.sleep(self.cycle_interval)
+   359→   359→
+   360→   360→            except KeyboardInterrupt:
+   361→   361→                log.info("Bot stopped by user")
+   362→   362→                break
+   363→   363→            except Exception as e:
+   364→   364→                log.error(f"Bot loop error: {e}", exc_info=True)
+   365→   365→                time.sleep(5)
+   366→   366→
+   367→   367→        self._running = False
+   368→   368→        log.info("Bot shutdown complete")
+   369→   369→
+   370→   370→    def _run_scan(self):
+   371→   371→        """Run market scanner."""
+   372→   372→        try:
+   373→   373→            result = self.scanner.scan()
+   374→   374→            self.state.scan_result = result
+   375→   375→            self.state.last_scan_time = time.time()
+   376→   376→            summary = self.scanner.format_scan_summary()
+   377→   377→            for line in summary.split("\n"):
+   378→   378→                log.info(line)
+   379→   379→        except Exception as e:
+   380→   380→            log.error(f"Scan failed: {e}")
+   381→   381→
+   382→   382→    def _update_positions(self):
+   383→   383→        """Update prices and check exits for open positions."""
+   384→   384→        if not self.state.open_positions:
+   385→   385→            return
+   386→   386→
+   387→   387→        to_close = []
+   388→   388→
+   389→   389→        for pos in self.state.open_positions:
+   390→   390→            try:
+   391→   391→                price = self.client.get_price(pos.symbol)
+   392→   392→                if price > 0:
+   393→   393→                    pos.update_price(price)
+   394→   394→
+   395→   395→                # Check exit conditions
+   396→   396→                exit_reason = pos.should_exit()
+   397→   397→                if exit_reason:
+   398→   398→                    to_close.append((pos, exit_reason, price))
+   399→   399→
+   400→   400→            except Exception as e:
+   401→   401→                log.warning(f"Failed to update {pos.symbol}: {e}")
+   402→   402→
+   403→   403→        # Close positions that need closing
+   404→   404→        for pos, reason, exit_price in to_close:
+   405→   405→            self._close_position(pos, reason, exit_price)
+   406→   406→
+   407→   407→    def _evaluate_signals(self):
+   408→   408→        """Evaluate strategy on top scanned symbols."""
+   409→   409→        if not self.state.scan_result or not self.state.scan_result.top_markets:
+   410→   410→            return
+   411→   411→
+   412→   412→        if len(self.state.open_positions) >= self._runtime_max_pos:
+   413→   413→            return
+   414→   414→
+   415→   415→        # Check minimum margin for opening new positions
+   416→   416→        min_margin_usd = self.initial_balance * self._runtime_min_margin_pct
+   417→   417→        if self.state.balance_usd < min_margin_usd:
+   418→   418→            return
+   419→   419→
+   420→   420→        top_markets = self.state.scan_result.top_markets[:15]
+   421→   421→        active_symbols = {p.symbol for p in self.state.open_positions}
+   422→   422→
+   423→   423→        for market in top_markets:
+   424→   424→            if market.symbol in active_symbols:
+   425→   425→                continue
+   426→   426→
+   427→   427→            if len(self.state.open_positions) >= self._runtime_max_pos:
+   428→   428→                break
+   429→   429→
+   430→   430→            if self.state.balance_usd < min_margin_usd:
+   431→   431→                break
+   432→   432→
+   433→   433→            try:
+   434→   434→                signal = self.strategy.evaluate(
+   435→   435→                    market.symbol,
+   436→   436→                    is_new_listing=market.is_new_listing,
+   437→   437→                    price_change_24h=market.price_change_pct_24h,
+   438→   438→                )
+   439→   439→                if signal:
+   440→   440→                    self._open_position(signal, market)
+   441→   441→            except Exception as e:
+   442→   442→                log.warning(f"Strategy eval failed for {market.symbol}: {e}")
+   443→   443→
+   444→   444→    def _open_position(self, signal: ScalpSignal, market: ScannedMarket):
+   445→   445→        """Open a realistic paper position — includes spread, slippage, fill simulation."""
+   446→   446→        leverage = self._runtime_leverage
+   447→   447→
+   448→   448→        # ─── Minimum margin check ─────────────────────────────
+   449→   449→        # Each trade must deploy at least min_margin_pct of initial balance.
+   450→   450→        # If available balance is below this threshold, wait for a trade to close.
+   451→   451→        # Example: init=$10, min_margin_pct=15% → min $1.50 per trade
+   452→   452→        # If balance < $1.50, skip — wait for close to free up margin.
+   453→   453→        min_margin_usd = self.initial_balance * self._runtime_min_margin_pct
+   454→   454→        if self.state.balance_usd < min_margin_usd:
+   455→   455→            log.debug(f"⏳ Balance ${self.state.balance_usd:.2f} < min margin ${min_margin_usd:.2f}, waiting for close")
+   456→   456→            return
+   457→   457→
+   458→   458→        # ─── Calculate intended position size ─────────────────
+   459→   459→        # Use equity (balance + deployed margin) so sizing is consistent
+   460→   460→        # regardless of how many positions are already open.
+   461→   461→        # This means each trade always risks sizing_pct of total equity.
+   462→   462→        equity = self.state.balance_usd + sum(p.margin_usd for p in self.state.open_positions)
+   463→   463→        margin_usd = equity * self._runtime_sizing
+   464→   464→        max_notional = self.strategy.config.get("max_notional_per_trade", 200.0)
+   465→   465→        margin_usd = min(margin_usd, max_notional / leverage)
+   466→   466→        # Cap at available balance (can deploy ALL — Binance futures has no gas)
+   467→   467→        margin_usd = min(margin_usd, self.state.balance_usd)
+   468→   468→
+   469→   469→        intended_notional = margin_usd * leverage
+   470→   470→        mid_price = signal.entry_price
+   471→   471→
+   472→   472→        # ─── SIMULATE REALISTIC ENTRY EXECUTION ───────────────
+   473→   473→        is_new_listing = getattr(market, 'is_new_listing', False)
+   474→   474→        is_meme = signal.symbol in self.executor.meme_symbols
+   475→   475→
+   476→   476→        exec_result = self.executor.simulate_entry(
+   477→   477→            symbol=signal.symbol,
+   478→   478→            side=signal.side,
+   479→   479→            price=mid_price,
+   480→   480→            notional_usd=intended_notional,
+   481→   481→            is_new_listing=is_new_listing,
+   482→   482→            is_meme=is_meme,
+   483→   483→        )
+   484→   484→
+   485→   485→        if not exec_result.filled:
+   486→   486→            # Order was rejected
+   487→   487→            self.state.rejected_orders += 1
+   488→   488→            log.warning(
+   489→   489→                f"⛔ ORDER REJECTED {signal.side} {signal.symbol}: {exec_result.reject_reason}"
+   490→   490→            )
+   491→   491→            return
+   492→   492→
+   493→   493→        # ─── Adjust position size for partial fill ────────────
+   494→   494→        actual_notional = exec_result.fill_notional
+   495→   495→        actual_margin = actual_notional / leverage
+   496→   496→
+   497→   497→        # Final check: can we afford this margin?
+   498→   498→        if actual_margin > self.state.balance_usd:
+   499→   499→            actual_margin = self.state.balance_usd * 0.8
+   500→   500→            actual_notional = actual_margin * leverage
+   501→   501→
+   502→   502→        if actual_margin < 0.10:
+   503→   503→            log.warning(f"⚠️ Cannot afford margin after execution (${actual_margin:.2f}), skipping")
+   504→   504→            return
+   505→   505→
+   506→   506→        fill_price = exec_result.fill_price
+   507→   507→        quantity = actual_notional / fill_price if fill_price > 0 else 0
+   508→   508→
+   509→   509→        if quantity <= 0:
+   510→   510→            return
+   511→   511→
+   512→   512→        pos = PaperPosition(
+   513→   513→            symbol=signal.symbol,
+   514→   514→            side=signal.side,
+   515→   515→            entry_price=fill_price,
+   516→   516→            mid_price=mid_price,
+   517→   517→            quantity=quantity,
+   518→   518→            notional_usd=actual_notional,
+   519→   519→            margin_usd=actual_margin,
+   520→   520→            leverage=leverage,
+   521→   521→            invested_at=time.time(),
+   522→   522→            take_profit_pct=self._runtime_tp,
+   523→   523→            stop_loss_pct=self._runtime_sl,
+   524→   524→            trailing_stop_pct=self._runtime_trail,
+   525→   525→            trailing_activation_pct=self._runtime_trail_act,
+   526→   526→            max_hold_sec=self._runtime_max_hold,
+   527→   527→            confidence=signal.confidence,
+   528→   528→            signal_reason=signal.reason,
+   529→   529→            volume_ratio=signal.volume_ratio,
+   530→   530→            momentum_pct=signal.momentum_pct,
+   531→   531→            rsi=signal.rsi,
+   532→   532→            # Realistic execution details
+   533→   533→            spread_cost_usd=exec_result.spread_cost_usd,
+   534→   534→            entry_slippage_bps=exec_result.slippage_bps,
+   535→   535→            entry_fee_usd=exec_result.fee_usd,
+   536→   536→            fill_qty_ratio=exec_result.fill_qty_ratio,
+   537→   537→            intended_notional_usd=intended_notional,
+   538→   538→            is_partial_fill=exec_result.fill_qty_ratio < 1.0,
+   539→   539→            is_new_listing=is_new_listing,
+   540→   540→        )
+   541→   541→
+   542→   542→        self.state.balance_usd -= actual_margin
+   543→   543→        self.state.open_positions.append(pos)
+   544→   544→
+   545→   545→        # Log the difference between mid and fill price
+   546→   546→        price_impact_pct = (fill_price - mid_price) / mid_price * 100
+   547→   547→        if signal.side == "SHORT":
+   548→   548→            price_impact_pct = -price_impact_pct  # For SHORT, adverse = price went up
+   549→   549→
+   550→   550→        log.info(
+   551→   551→            f"📌 OPEN {signal.side} {signal.symbol} "
+   552→   552→            f"@ {fill_price:.6g} (mid={mid_price:.6g}, impact={price_impact_pct:+.3f}%) "
+   553→   553→            f"margin=${actual_margin:.2f} notional=${actual_notional:.2f} lev={leverage}x "
+   554→   554→            f"TP={self._runtime_tp}% SL={self._runtime_sl}% "
+   555→   555→            f"fee=${exec_result.fee_usd:.4f} "
+   556→   556→            f"[{signal.reason}] conf={signal.confidence:.2f}"
+   557→   557→            + (" ⚠️ PARTIAL" if pos.is_partial_fill else "")
+   558→   558→        )
+   559→   559→
+   560→   560→    def _close_position(self, pos: PaperPosition, reason: str, exit_price: float):
+   561→   561→        """Close a realistic paper position — includes exit spread, slippage, fee."""
+   562→   562→        if exit_price <= 0:
+   563→   563→            exit_price = pos.current_price or pos.entry_price
+   564→   564→
+   565→   565→        # ─── Exit price logic ───────────────────────────────
+   566→   566→        # SL_HIT and TP_HIT: use exact trigger price (like exchange stop-limit orders).
+   567→   567→        # In live trading, stop-limit orders guarantee the exit price at the trigger level.
+   568→   568→        # Only MAX_HOLD and TRAILING_STOP use simulated fill (market order, no guarantee).
+   569→   569→        if reason in ("SL_HIT", "TP_HIT"):
+   570→   570→            # Calculate the exact trigger price based on PnL% threshold
+   571→   571→            if reason == "SL_HIT":
+   572→   572→                target_pct = -pos.stop_loss_pct
+   573→   573→            else:
+   574→   574→                target_pct = pos.take_profit_pct
+   575→   575→            if pos.side == "LONG":
+   576→   576→                actual_exit_price = pos.entry_price * (1 + target_pct / 100)
+   577→   577→            else:
+   578→   578→                actual_exit_price = pos.entry_price * (1 - target_pct / 100)
+   579→   579→            # Only fee on exit (no spread/slippage — stop-limit is a maker-like fill)
+   580→   580→            exit_fee = pos.notional_usd * self.executor.taker_fee_pct / 100
+   581→   581→            exit_spread_cost = 0.0
+   582→   582→            exit_slippage_bps = 0.0
+   583→   583→        else:
+   584→   584→            # MAX_HOLD, TRAILING_STOP: market order with spread + slippage
+   585→   585→            exit_result = self.executor.simulate_exit(
+   586→   586→                symbol=pos.symbol,
+   587→   587→                side=pos.side,
+   588→   588→                price=exit_price,
+   589→   589→                notional_usd=pos.notional_usd,
+   590→   590→                is_new_listing=pos.is_new_listing,
+   591→   591→            )
+   592→   592→            actual_exit_price = exit_result.fill_price if exit_result.filled else exit_price
+   593→   593→            exit_fee = exit_result.fee_usd if exit_result.filled else pos.notional_usd * self.executor.taker_fee_pct / 100
+   594→   594→            exit_spread_cost = exit_result.spread_cost_usd if exit_result.filled else 0.0
+   595→   595→            exit_slippage_bps = exit_result.slippage_bps if exit_result.filled else 0.0
+   596→   596→
+   597→   597→        # Recalculate PnL with actual exit price
+   598→   598→        if pos.side == "LONG":
+   599→   599→            gross_pnl_pct = (actual_exit_price - pos.entry_price) / pos.entry_price * 100
+   600→   600→        else:
+   601→   601→            gross_pnl_pct = (pos.entry_price - actual_exit_price) / pos.entry_price * 100
+   602→   602→        actual_pnl = pos.margin_usd * pos.leverage * (gross_pnl_pct / 100)
+   603→   603→
+   604→   604→        # Total fee = entry fee + exit fee (both TAKER)
+   605→   605→        total_fees = pos.entry_fee_usd + exit_fee
+   606→   606→
+   607→   607→        # Net PnL after all fees and spread costs
+   608→   608→        net_pnl = actual_pnl - total_fees
+   609→   609→
+   610→   610→        # Net PnL% = gross PnL% minus fee impact
+   611→   611→        # PnL% should be based on NOTIONAL (position size), not margin.
+   612→   612→        # Example: gross +1.0%, fees 0.10% round-trip → net +0.9%
+   613→   613→        # NOT: net_pnl / margin (that would give 20x leverage-boosted %!)
+   614→   614→        fee_impact_pct = (total_fees / pos.notional_usd * 100) if pos.notional_usd > 0 else 0
+   615→   615→        net_pnl_pct = gross_pnl_pct - fee_impact_pct
+   616→   616→
+   617→   617→        # Update balance
+   618→   618→        self.state.balance_usd += pos.margin_usd + net_pnl
+   619→   619→
+   620→   620→        # Record trade
+   621→   621→        hold_sec = time.time() - pos.invested_at
+   622→   622→        trade = TradeRecord(
+   623→   623→            symbol=pos.symbol,
+   624→   624→            side=pos.side,
+   625→   625→            entry_price=pos.entry_price,
+   626→   626→            exit_price=actual_exit_price,
+   627→   627→            leverage=pos.leverage,
+   628→   628→            margin_usd=pos.margin_usd,
+   629→   629→            notional_usd=pos.notional_usd,
+   630→   630→            pnl_usd=round(net_pnl, 4),
+   631→   631→            pnl_pct=round(net_pnl_pct, 3),
+   632→   632→            hold_sec=round(hold_sec, 1),
+   633→   633→            exit_reason=reason,
+   634→   634→            confidence=pos.confidence,
+   635→   635→            signal_reason=pos.signal_reason,
+   636→   636→            timestamp=time.time(),
+   637→   637→            mid_price_entry=pos.mid_price,
+   638→   638→            spread_cost_usd=round(pos.spread_cost_usd, 4),
+   639→   639→            entry_slippage_bps=round(pos.entry_slippage_bps, 2),
+   640→   640→            exit_slippage_bps=round(exit_slippage_bps, 2),
+   641→   641→            entry_fee_usd=round(pos.entry_fee_usd, 4),
+   642→   642→            exit_fee_usd=round(exit_fee, 4),
+   643→   643→            total_fees_usd=round(total_fees, 4),
+   644→   644→            fill_qty_ratio=pos.fill_qty_ratio,
+   645→   645→            is_partial_fill=pos.is_partial_fill,
+   646→   646→            max_favorable_pct=round(pos.max_favorable_pct, 3),
+   647→   647→            max_adverse_pct=round(pos.max_adverse_pct, 3),
+   648→   648→            tp_would_hit=pos.tp_would_hit,
+   649→   649→            sl_would_hit=pos.sl_would_hit,
+   650→   650→            price_updates=pos.price_updates,
+   651→   651→        )
+   652→   652→
+   653→   653→        self.state.trade_history.append(trade)
+   654→   654→        self.state.total_pnl += net_pnl
+   655→   655→        self.state.total_fees += total_fees
+   656→   656→        self.state.total_spread_cost += pos.spread_cost_usd
+   657→   657→
+   658→   658→        if net_pnl > 0:
+   659→   659→            self.state.wins += 1
+   660→   660→        else:
+   661→   661→            self.state.losses += 1
+   662→   662→
+   663→   663→        # ─── Save to persistent database with runtime config snapshot ────
+   664→   664→        if self.db:
+   665→   665→            try:
+   666→   666→                runtime_snapshot = {
+   667→   667→                    "take_profit_pct": pos.take_profit_pct,
+   668→   668→                    "stop_loss_pct": pos.stop_loss_pct,
+   669→   669→                    "trailing_stop_pct": pos.trailing_stop_pct,
+   670→   670→                    "trailing_activation_pct": pos.trailing_activation_pct,
+   671→   671→                    "max_hold_sec": pos.max_hold_sec,
+   672→   672→                    "leverage": pos.leverage,
+   673→   673→                    "sizing_pct": self._runtime_sizing,
+   674→   674→                    "min_margin_pct": self._runtime_min_margin_pct,
+   675→   675→                    "max_positions": self._runtime_max_pos,
+   676→   676→                    "initial_balance": self.initial_balance,
+   677→   677→                    "balance_at_open": self.state.balance_usd + pos.margin_usd,
+   678→   678→                    "equity_at_open": self.state.balance_usd + pos.margin_usd + sum(p.margin_usd for p in self.state.open_positions if p is not pos),
+   679→   679→                }
+   680→   680→                self.db.save_trade({
+   681→   681→                    "symbol": pos.symbol,
+   682→   682→                    "side": pos.side,
+   683→   683→                    "entry_price": pos.entry_price,
+   684→   684→                    "exit_price": actual_exit_price,
+   685→   685→                    "leverage": pos.leverage,
+   686→   686→                    "margin_usd": pos.margin_usd,
+   687→   687→                    "notional_usd": pos.notional_usd,
+   688→   688→                    "pnl_usd": round(net_pnl, 4),
+   689→   689→                    "pnl_pct": round(net_pnl_pct, 3),
+   690→   690→                    "hold_sec": round(hold_sec, 1),
+   691→   691→                    "exit_reason": reason,
+   692→   692→                    "confidence": pos.confidence,
+   693→   693→                    "signal_reason": pos.signal_reason,
+   694→   694→                    "volume_ratio": pos.volume_ratio,
+   695→   695→                    "momentum_pct": pos.momentum_pct,
+   696→   696→                    "rsi": pos.rsi,
+   697→   697→                    "max_favorable_pct": round(pos.max_favorable_pct, 3),
+   698→   698→                    "max_adverse_pct": round(pos.max_adverse_pct, 3),
+   699→   699→                    "tp_would_hit": pos.tp_would_hit,
+   700→   700→                    "sl_would_hit": pos.sl_would_hit,
+   701→   701→                    "price_updates": pos.price_updates,
+   702→   702→                    "fee_usd": round(total_fees, 4),
+   703→   703→                    "opened_at": pos.invested_at,
+   704→   704→                    "closed_at": time.time(),
+   705→   705→                    # Realistic execution details (v2)
+   706→   706→                    "mid_price_entry": pos.mid_price,
+   707→   707→                    "spread_cost_usd": round(pos.spread_cost_usd, 4),
+   708→   708→                    "entry_slippage_bps": round(pos.entry_slippage_bps, 2),
+   709→   709→                    "exit_slippage_bps": round(exit_slippage_bps, 2),
+   710→   710→                    "entry_fee_usd": round(pos.entry_fee_usd, 4),
+   711→   711→                    "exit_fee_usd": round(exit_fee, 4),
+   712→   712→                    "total_fees_usd": round(total_fees, 4),
+   713→   713→                    "fill_qty_ratio": pos.fill_qty_ratio,
+   714→   714→                    "is_partial_fill": pos.is_partial_fill,
+   715→   715→                    "gross_pnl_pct": round(gross_pnl_pct, 3),
+   716→   716→                    "fee_impact_pct": round(fee_impact_pct, 3),
+   717→   717→                    # Runtime config snapshot (critical for backtest)
+   718→   718→                    "runtime_config": runtime_snapshot,
+   719→   719→                })
+   720→   720→            except Exception as e:
+   721→   721→                log.warning(f"Failed to save trade to DB: {e}")
+   722→   722→
+   723→   723→        # Remove from open positions
+   724→   724→        self.state.open_positions = [p for p in self.state.open_positions if p is not pos]
+   725→   725→
+   726→   726→        # Mark cooldown
+   727→   727→        self.strategy.mark_cooldown(pos.symbol)
+   728→   728→
+   729→   729→        pnl_emoji = "✅" if net_pnl > 0 else "❌"
+   730→   730→        log.info(
+   731→   731→            f"{pnl_emoji} CLOSE {pos.side} {pos.symbol} "
+   732→   732→            f"PnL=${net_pnl:+.4f} ({net_pnl_pct:+.3f}% net, {gross_pnl_pct:+.3f}% gross) "
+   733→   733→            f"hold={hold_sec:.0f}s reason={reason} "
+   734→   734→            f"bal=${self.state.balance_usd:.2f} "
+   735→   735→            f"| fees=${total_fees:.4f} spread=${pos.spread_cost_usd:.4f} "
+   736→   736→            f"| Peak={pos.max_favorable_pct:+.3f}% Dip={pos.max_adverse_pct:+.3f}% "
+   737→   737→            f"({pos.price_updates} ticks)"
+   738→   738→        )
+   739→   739→
+   740→   740→    def _record_equity(self):
+   741→   741→        """Record equity for chart."""
+   742→   742→        margin_dep = sum(p.margin_usd for p in self.state.open_positions)
+   743→   743→        unreal = sum(p.unrealized_pnl for p in self.state.open_positions)
+   744→   744→        equity = self.state.balance_usd + margin_dep + unreal
+   745→   745→
+   746→   746→        self.state.equity_history.append({
+   747→   747→            "t": round(time.time(), 1),
+   748→   748→            "v": round(equity, 2),
+   749→   749→        })
+   750→   750→
+   751→   751→        if len(self.state.equity_history) > 1000:
+   752→   752→            self.state.equity_history = self.state.equity_history[-1000:]
+   753→   753→
+   754→   754→    def _log_status(self):
+   755→   755→        """Log periodic status."""
+   756→   756→        margin_dep = sum(p.margin_usd for p in self.state.open_positions)
+   757→   757→        unreal = sum(p.unrealized_pnl for p in self.state.open_positions)
+   758→   758→        equity = self.state.balance_usd + margin_dep + unreal
+   759→   759→
+   760→   760→        total_trades = self.state.wins + self.state.losses
+   761→   761→        win_rate = (self.state.wins / total_trades * 100) if total_trades > 0 else 0
+   762→   762→
+   763→   763→        exec_stats = self.executor.stats
+   764→   764→
+   765→   765→        log.info(
+   766→   766→            f"📊 Equity: ${equity:.2f} | "
+   767→   767→            f"Balance: ${self.state.balance_usd:.2f} | "
+   768→   768→            f"Positions: {len(self.state.open_positions)} | "
+   769→   769→            f"PnL: ${self.state.total_pnl:+.4f} | "
+   770→   770→            f"Fees: ${self.state.total_fees:.4f} | "
+   771→   771→            f"Trades: {total_trades} ({win_rate:.0f}% win) | "
+   772→   772→            f"Rejected: {self.state.rejected_orders} | "
+   773→   773→            f"Exec fill rate: {exec_stats['fill_rate']:.0%}"
+   774→   774→        )
+   775→   775→
+   776→   776→    # ─── Dashboard API ─────────────────────────────────────
+   777→   777→
+   778→   778→    def _start_dashboard(self):
+   779→   779→        """Start HTTP API for dashboard."""
+   780→   780→        bot = self
+   781→   781→
+   782→   782→        class APIHandler(BaseHTTPRequestHandler):
+   783→   783→            def do_GET(self):
+   784→   784→                if self.path.split("?")[0] == "/api/stats":
+   785→   785→                    data = bot._build_stats()
+   786→   786→                    self._send_json(data)
+   787→   787→                elif self.path.split("?")[0] == "/":
+   788→   788→                    self._send_html(bot._build_dashboard_html())
+   789→   789→                else:
+   790→   790→                    self.send_response(404)
+   791→   791→                    self.end_headers()
+   792→   792→
+   793→   793→            def do_POST(self):
+   794→   794→                path = self.path.split("?")[0]
+   795→   795→                if path == "/api/restart":
+   796→   796→                    self._send_json({"status": "restarting"})
+   797→   797→                    log.info("🔄 Restart requested via dashboard")
+   798→   798→                    import subprocess
+   799→   799→                    # Restart via systemd — systemd will stop the current process
+   800→   800→                    # and start a fresh one. No need to kill self.
+   801→   801→                    # Run in background so the response can be sent first.
+   802→   802→                    subprocess.Popen(
+   803→   803→                        ["sudo", "systemctl", "restart", "claw-realistic"],
+   804→   804→                        stdout=subprocess.DEVNULL,
+   805→   805→                        stderr=subprocess.DEVNULL
+   806→   806→                    )
+   807→   807→                elif path == "/api/reset_balance":
+   808→   808→                    content_length = int(self.headers.get('Content-Length', 0))
+   809→   809→                    body = self.rfile.read(content_length).decode('utf-8') if content_length else '{}'
+   810→   810→                    try:
+   811→   811→                        params = json.loads(body) if body else {}
+   812→   812→                        new_bal = params.get("initial_balance", bot.initial_balance)
+   813→   813→                        for pos in bot.state.open_positions[:]:
+   814→   814→                            bot.state.balance_usd += pos.margin_usd
+   815→   815→                            bot.state.open_positions.remove(pos)
+   816→   816→                        bot.state.balance_usd = float(new_bal)
+   817→   817→                        bot.initial_balance = float(new_bal)
+   818→   818→                        bot.state.wins = 0
+   819→   819→                        bot.state.losses = 0
+   820→   820→                        bot.state.total_pnl = 0.0
+   821→   821→                        bot.state.total_fees = 0.0
+   822→   822→                        bot.state.total_spread_cost = 0.0
+   823→   823→                        bot.state.rejected_orders = 0
+   824→   824→                        bot.state.equity_history = []
+   825→   825→                        log.info(f"🔄 Balance reset to ${new_bal:.2f} via dashboard")
+   826→   826→                        self._send_json({"status": "ok", "balance": float(new_bal)})
+   827→   827→                    except Exception as e:
+   828→   828→                        self._send_json({"status": "error", "message": str(e)})
+   829→   829→                elif path == "/api/config":
+   830→   830→                    content_length = int(self.headers.get('Content-Length', 0))
+   831→   831→                    body = self.rfile.read(content_length).decode('utf-8')
+   832→   832→                    try:
+   833→   833→                        params = json.loads(body)
+   834→   834→                        applied = bot._handle_config_update(params)
+   835→   835→                        self._send_json({"status": "ok", "applied": applied})
+   836→   836→                    except Exception as e:
+   837→   837→                        self._send_json({"status": "error", "message": str(e)})
+   838→   838→                else:
+   839→   839→                    self.send_response(404)
+   840→   840→                    self.end_headers()
+   841→   841→
+   842→   842→            def _send_json(self, data):
+   843→   843→                self.send_response(200)
+   844→   844→                self.send_header("Content-Type", "application/json")
+   845→   845→                self.send_header("Access-Control-Allow-Origin", "*")
+   846→   846→                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+   847→   847→                self.send_header("Pragma", "no-cache")
+   848→   848→                self.send_header("Expires", "0")
+   849→   849→                self.end_headers()
+   850→   850→                self.wfile.write(json.dumps(data).encode())
+   851→   851→
+   852→   852→            def _send_html(self, html):
+   853→   853→                self.send_response(200)
+   854→   854→                self.send_header("Content-Type", "text/html")
+   855→   855→                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+   856→   856→                self.send_header("Pragma", "no-cache")
+   857→   857→                self.send_header("Expires", "0")
+   858→   858→                self.end_headers()
+   859→   859→                self.wfile.write(html.encode())
+   860→   860→
+   861→   861→            def log_message(self, format, *args):
+   862→   862→                pass
+   863→   863→
+   864→   864→        class ReuseHTTPServer(HTTPServer):
+   865→   865→            allow_reuse_address = True
+   866→   866→
+   867→   867→        try:
+   868→   868→            server = ReuseHTTPServer(("0.0.0.0", self.dashboard_port), APIHandler)
+   869→   869→        except OSError as e:
+   870→   870→            log.warning(f"⚠️  Dashboard port {self.dashboard_port} in use ({e}), trying +1...")
+   871→   871→            self.dashboard_port += 1
+   872→   872→            try:
+   873→   873→                server = ReuseHTTPServer(("0.0.0.0", self.dashboard_port), APIHandler)
+   874→   874→            except OSError:
+   875→   875→                log.warning(f"⚠️  Dashboard port {self.dashboard_port} also in use, skipping dashboard")
+   876→   876→                return
+   877→   877→
+   878→   878→        thread = threading.Thread(target=server.serve_forever, daemon=True)
+   879→   879→        thread.start()
+   880→   880→        log.info(f"Dashboard API started on port {self.dashboard_port}")
+   881→   881→
+   882→   882→    def _build_stats(self) -> dict:
+   883→   883→        """Build stats JSON for API."""
+   884→   884→        margin_dep = sum(p.margin_usd for p in self.state.open_positions)
+   885→   885→        unreal = sum(p.unrealized_pnl for p in self.state.open_positions)
+   886→   886→        equity = self.state.balance_usd + margin_dep + unreal
+   887→   887→
+   888→   888→        total_trades = self.state.wins + self.state.losses
+   889→   889→        win_rate = (self.state.wins / total_trades * 100) if total_trades > 0 else 0
+   890→   890→        drawdown_pct = (1 - equity / self.initial_balance) * 100 if self.initial_balance > 0 else 0
+   891→   891→        trading_paused = drawdown_pct >= self._max_drawdown_pct or self.state.balance_usd < 1.0
+   892→   892→
+   893→   893→        portfolio = {
+   894→   894→            "balance_usd": round(self.state.balance_usd, 2),
+   895→   895→            "margin_deployed": round(margin_dep, 2),
+   896→   896→            "unrealized_pnl": round(unreal, 4),
+   897→   897→            "equity": round(equity, 2),
+   898→   898→            "initial_balance": self.initial_balance,
+   899→   899→            "total_pnl": round(self.state.total_pnl, 4),
+   900→   900→            "growth_pct": round((equity / self.initial_balance - 1) * 100, 2),
+   901→   901→            "drawdown_pct": round(drawdown_pct, 1),
+   902→   902→            "trading_paused": trading_paused,
+   903→   903→            "total_trades": total_trades,
+   904→   904→            "win_rate": round(win_rate, 1),
+   905→   905→            "equity_history": self.state.equity_history[-500:],
+   906→   906→            # Realistic execution stats
+   907→   907→            "total_fees": round(self.state.total_fees, 4),
+   908→   908→            "total_spread_cost": round(self.state.total_spread_cost, 4),
+   909→   909→            "rejected_orders": self.state.rejected_orders,
+   910→   910→        }
+   911→   911→
+   912→   912→        positions = []
+   913→   913→        for p in self.state.open_positions:
+   914→   914→            positions.append({
+   915→   915→                "symbol": p.symbol,
+   916→   916→                "side": p.side,
+   917→   917→                "entry_price": p.entry_price,
+   918→   918→                "mid_price": p.mid_price,
+   919→   919→                "current_price": p.current_price,
+   920→   920→                "leverage": p.leverage,
+   921→   921→                "margin_usd": round(p.margin_usd, 2),
+   922→   922→                "notional_usd": round(p.notional_usd, 2),
+   923→   923→                "unrealized_pnl": round(p.unrealized_pnl, 4),
+   924→   924→                "unrealized_pnl_pct": round(p.unrealized_pnl_pct, 3),
+   925→   925→                "highest_pnl_pct": round(p.highest_pnl_pct, 3),
+   926→   926→                "trailing_active": p.trailing_active,
+   927→   927→                "hold_sec": round(time.time() - p.invested_at, 0),
+   928→   928→                "confidence": p.confidence,
+   929→   929→                "signal_reason": p.signal_reason,
+   930→   930→                "entry_slippage_bps": round(p.entry_slippage_bps, 1),
+   931→   931→                "is_partial_fill": p.is_partial_fill,
+   932→   932→                # Top-level TP/SL for dashboard display
+   933→   933→                "tp": p.take_profit_pct,
+   934→   934→                "sl": p.stop_loss_pct,
+   935→   935→                "exit_checks": {
+   936→   936→                    "tp": p.take_profit_pct,
+   937→   937→                    "sl": p.stop_loss_pct,
+   938→   938→                    "max_hold": p.max_hold_sec,
+   939→   939→                },
+   940→   940→            })
+   941→   941→
+   942→   942→        scanner_data = {
+   943→   943→            "last_scan": self.state.last_scan_time,
+   944→   944→            "total_markets": getattr(self.state.scan_result, "total_markets", 0),
+   945→   945→            "filtered_markets": getattr(self.state.scan_result, "filtered_markets", 0),
+   946→   946→            "new_listings": getattr(self.state.scan_result, "new_listings", 0),
+   947→   947→            "top_markets": [],
+   948→   948→        }
+   949→   949→        if self.state.scan_result and hasattr(self.state.scan_result, "top_markets"):
+   950→   950→            for m in self.state.scan_result.top_markets[:7]:
+   951→   951→                scanner_data["top_markets"].append({
+   952→   952→                    "symbol": m.symbol,
+   953→   953→                    "base_asset": m.base_asset,
+   954→   954→                    "quote_volume_24h_m": round(m.quote_volume_24h / 1e6, 1),
+   955→   955→                    "price_change_pct": round(m.price_change_pct_24h, 2),
+   956→   956→                    "last_price": m.last_price,
+   957→   957→                    "listing_age_days": round(m.listing_age_days, 1),
+   958→   958→                    "is_new_listing": m.is_new_listing,
+   959→   959→                    "total_score": round(m.total_score, 1),
+   960→   960→                    "funding_rate": m.funding_rate,
+   961→   961→                })
+   962→   962→
+   963→   963→        recent_trades = []
+   964→   964→        for t in self.state.trade_history[-20:]:
+   965→   965→            recent_trades.append({
+   966→   966→                "symbol": t.symbol,
+   967→   967→                "side": t.side,
+   968→   968→                "entry": t.entry_price,
+   969→   969→                "exit": t.exit_price,
+   970→   970→                "leverage": t.leverage,
+   971→   971→                "margin_usd": round(t.margin_usd, 2),
+   972→   972→                "notional_usd": round(t.notional_usd, 2),
+   973→   973→                "pnl_usd": round(t.pnl_usd, 4),
+   974→   974→                "pnl_pct": round(t.pnl_pct, 3),
+   975→   975→                "hold_sec": t.hold_sec,
+   976→   976→                "exit_reason": t.exit_reason,
+   977→   977→                "confidence": t.confidence,
+   978→   978→                "reason": t.signal_reason,
+   979→   979→                "time": t.timestamp,
+   980→   980→                # Realistic execution details
+   981→   981→                "mid_price_entry": t.mid_price_entry,
+   982→   982→                "total_fees_usd": round(t.total_fees_usd, 4),
+   983→   983→                "spread_cost_usd": round(t.spread_cost_usd, 4),
+   984→   984→                "entry_slippage_bps": t.entry_slippage_bps,
+   985→   985→                "exit_slippage_bps": t.exit_slippage_bps,
+   986→   986→                "is_partial_fill": t.is_partial_fill,
+   987→   987→                # Signal accuracy
+   988→   988→                "max_favorable_pct": t.max_favorable_pct,
+   989→   989→                "max_adverse_pct": t.max_adverse_pct,
+   990→   990→                "tp_would_hit": t.tp_would_hit,
+   991→   991→                "sl_would_hit": t.sl_would_hit,
+   992→   992→                "price_updates": t.price_updates,
+   993→   993→            })
+   994→   994→
+   995→   995→        strategy_stats = self.strategy.get_stats()
+   996→   996→        exec_stats = self.executor.stats
+   997→   997→
+   998→   998→        runtime_config = {
+   999→   999→            "take_profit_pct": self._runtime_tp,
+  1000→  1000→            "stop_loss_pct": self._runtime_sl,
+  1001→  1001→            "max_hold_sec": self._runtime_max_hold,
+  1002→  1002→            "trailing_stop_pct": self._runtime_trail,
+  1003→  1003→            "trailing_activation_pct": self._runtime_trail_act,
+  1004→  1004→            "max_positions": self._runtime_max_pos,
+  1005→  1005→            "sizing_pct": self._runtime_sizing,
+  1006→  1006→            "min_margin_pct": self._runtime_min_margin_pct,
+  1007→  1007→            "leverage": self._runtime_leverage,
+  1008→  1008→        }
+  1009→  1009→
+  1010→  1010→        return {
+  1011→  1011→            "bot": {
+  1012→  1012→                "name": self.bot_name,
+  1013→  1013→                "mode": "realistic_paper",
+  1014→  1014→                "uptime_sec": round(time.time() - self.state.start_time, 0),
+  1015→  1015→                "cycles": self.state.cycle_count,
+  1016→  1016→            },
+  1017→  1017→            "portfolio": portfolio,
+  1018→  1018→            "positions": positions,
+  1019→  1019→            "scanner": scanner_data,
+  1020→  1020→            "trades": recent_trades,
+  1021→  1021→            "strategy": strategy_stats,
+  1022→  1022→            "executor": exec_stats,
+  1023→  1023→            "config": runtime_config,
+  1024→  1024→        }
+  1025→  1025→
+  1026→  1026→    def _handle_config_update(self, params: dict) -> dict:
+  1027→  1027→        """Handle runtime config updates from dashboard sliders.
+  1028→  1028→        
+  1029→  1029→        When update_open_positions=True, also applies SL/TP/trailing
+  1030→  1030→        changes to already-open positions. This prevents the common
+  1031→  1031→        issue where slider changes only affect new positions, causing
+  1032→  1032→        SL exits at old config values.
+  1033→  1033→        """
+  1034→  1034→        applied = {}
+  1035→  1035→        update_existing = params.get("update_open_positions", True)
+  1036→  1036→        
+  1037→  1037→        if "take_profit_pct" in params:
+  1038→  1038→            val = float(params["take_profit_pct"])
+  1039→  1039→            if 0.1 <= val <= 5.0:
+  1040→  1040→                self._runtime_tp = val
+  1041→  1041→                self.strategy.take_profit_pct = val
+  1042→  1042→                applied["take_profit_pct"] = val
+  1043→  1043→                # Update existing positions too
+  1044→  1044→                if update_existing:
+  1045→  1045→                    for p in self.state.open_positions:
+  1046→  1046→                        old_tp = p.take_profit_pct
+  1047→  1047→                        p.take_profit_pct = val
+  1048→  1048→                        # If trailing was active and based on old TP, reset it
+  1049→  1049→                        if p.trailing_active and old_tp != val:
+  1050→  1050→                            p.trailing_active = False  # Will re-activate if PnL reaches new threshold
+  1051→  1051→        if "stop_loss_pct" in params:
+  1052→  1052→            val = float(params["stop_loss_pct"])
+  1053→  1053→            if 0.1 <= val <= 5.0:
+  1054→  1054→                self._runtime_sl = val
+  1055→  1055→                self.strategy.stop_loss_pct = val
+  1056→  1056→                applied["stop_loss_pct"] = val
+  1057→  1057→                # Update existing positions too
+  1058→  1058→                if update_existing:
+  1059→  1059→                    for p in self.state.open_positions:
+  1060→  1060→                        p.stop_loss_pct = val
+  1061→  1061→        if "max_hold_sec" in params:
+  1062→  1062→            val = int(params["max_hold_sec"])
+  1063→  1063→            if 60 <= val <= 3600:
+  1064→  1064→                self._runtime_max_hold = val
+  1065→  1065→                self.strategy.max_hold_sec = val
+  1066→  1066→                applied["max_hold_sec"] = val
+  1067→  1067→                if update_existing:
+  1068→  1068→                    for p in self.state.open_positions:
+  1069→  1069→                        p.max_hold_sec = val
+  1070→  1070→        if "trailing_stop_pct" in params:
+  1071→  1071→            val = float(params["trailing_stop_pct"])
+  1072→  1072→            if 0.05 <= val <= 2.0:
+  1073→  1073→                self._runtime_trail = val
+  1074→  1074→                self.strategy.trailing_stop_pct = val
+  1075→  1075→                applied["trailing_stop_pct"] = val
+  1076→  1076→                if update_existing:
+  1077→  1077→                    for p in self.state.open_positions:
+  1078→  1078→                        p.trailing_stop_pct = val
+  1079→  1079→        if "trailing_activation_pct" in params:
+  1080→  1080→            val = float(params["trailing_activation_pct"])
+  1081→  1081→            if 0.1 <= val <= 5.0:
+  1082→  1082→                self._runtime_trail_act = val
+  1083→  1083→                self.strategy.trailing_activation_pct = val
+  1084→  1084→                applied["trailing_activation_pct"] = val
+  1085→  1085→                if update_existing:
+  1086→  1086→                    for p in self.state.open_positions:
+  1087→  1087→                        p.trailing_activation_pct = val
+  1088→  1088→        if "max_positions" in params:
+  1089→  1089→            val = int(params["max_positions"])
+  1090→  1090→            if 1 <= val <= 20:
+  1091→  1091→                self._runtime_max_pos = val
+  1092→  1092→                self.strategy.max_positions = val
+  1093→  1093→                applied["max_positions"] = val
+  1094→  1094→        if "sizing_pct" in params:
+  1095→  1095→            val = float(params["sizing_pct"])
+  1096→  1096→            if 0.05 <= val <= 0.80:
+  1097→  1097→                self._runtime_sizing = val
+  1098→  1098→                self.strategy.sizing_pct = val
+  1099→  1099→                applied["sizing_pct"] = val
+  1100→  1100→        if "min_margin_pct" in params:
+  1101→  1101→            val = float(params["min_margin_pct"])
+  1102→  1102→            if 0.05 <= val <= 0.50:
+  1103→  1103→                self._runtime_min_margin_pct = val
+  1104→  1104→                applied["min_margin_pct"] = val
+  1105→  1105→        if "leverage" in params:
+  1106→  1106→            val = int(params["leverage"])
+  1107→  1107→            if 1 <= val <= 125:
+  1108→  1108→                self._runtime_leverage = val
+  1109→  1109→                self.strategy.default_leverage = val
+  1110→  1110→                applied["leverage"] = val
+  1111→  1111→                # Note: leverage change does NOT update existing positions
+  1112→  1112→                # (can't change leverage on an open futures position in real trading)
+  1113→  1113→        if applied:
+  1114→  1114→            n_open = len(self.state.open_positions)
+  1115→  1115→            log.info(f"⚙️ Config updated: {applied}" + (f" (also applied to {n_open} open positions)" if update_existing and n_open else ""))
+  1116→  1116→        return applied
+  1117→  1117→
+  1118→  1118→    def _build_dashboard_html(self) -> str:
+  1119→  1119→        """Build single-page dashboard HTML with realistic mode indicator."""
+  1120→  1120→        return """<!DOCTYPE html>
+  1121→  1121→<html lang="en">
+  1122→  1122→<head>
+  1123→  1123→<meta charset="UTF-8">
+  1124→  1124→<meta name="viewport" content="width=device-width, initial-scale=1.0">
+  1125→  1125→<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  1126→  1126→<meta http-equiv="Pragma" content="no-cache">
+  1127→  1127→<meta http-equiv="Expires" content="0">
+  1128→  1128→<title>Claw-Binance Realistic Paper Bot</title>
+  1129→  1129→<style>
+  1130→  1130→*{margin:0;padding:0;box-sizing:border-box}
+  1131→  1131→body{background:#08080e;color:#d0d0d8;font-family:'SF Mono','Fira Code','Consolas','Monaco',monospace;font-size:15px;line-height:1.5}
+  1132→  1132→.header{background:linear-gradient(135deg,#10101e,#141428);padding:14px 24px;border-bottom:2px solid #1e1e3a;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:100}
+  1133→  1133→.header h1{font-size:20px;color:#ff6b35;font-weight:800;letter-spacing:-0.5px}
+  1134→  1134→.header .right{display:flex;align-items:center;gap:12px}
+  1135→  1135→.badge-realistic{background:#ff4444;color:#fff;padding:3px 10px;border-radius:5px;font-weight:bold;font-size:12px;letter-spacing:0.5px;border:1px solid #ff6666}
+  1136→  1136→.pulse{width:10px;height:10px;border-radius:50%;background:#00ff88;animation:blink 1.5s infinite}
+  1137→  1137→.pulse.off{background:#ff4444;animation:none}
+  1138→  1138→@keyframes blink{0%,100%{opacity:1}50%{opacity:0.3}}
+  1139→  1139→.update-time{color:#666;font-size:13px}
+  1140→  1140→
+  1141→  1141→.eq-bar{background:linear-gradient(135deg,#0a0a16,#0e0e1e);border-bottom:2px solid #1a1a36;padding:20px 24px;display:flex;flex-wrap:wrap;gap:12px 32px;align-items:flex-end}
+  1142→  1142→.eq-item{display:flex;flex-direction:column;gap:3px}
+  1143→  1143→.eq-lbl{color:#556;font-size:11px;text-transform:uppercase;letter-spacing:1.5px;font-weight:600}
+  1144→  1144→.eq-val{font-size:22px;font-weight:800}
+  1145→  1145→.eq-val.big{font-size:38px;letter-spacing:-1px}
+  1146→  1146→.eq-sub{font-size:14px;color:#667;margin-left:8px;font-weight:600}
+  1147→  1147→.eq-chart{flex:1;min-width:350px;max-width:650px;height:100px}
+  1148→  1148→
+  1149→  1149→.cost-bar{background:#0e0a0a;border-bottom:1px solid #2a1414;padding:10px 24px;display:flex;flex-wrap:wrap;gap:8px 24px;font-size:13px}
+  1150→  1150→.cost-item{display:flex;align-items:center;gap:4px}
+  1151→  1151→.cost-lbl{color:#665;font-size:10px;text-transform:uppercase;letter-spacing:1px}
+  1152→  1152→.cost-val{font-weight:700}
+  1153→  1153→
+  1154→  1154→.cfg-bar{background:#0c0c18;border-bottom:2px solid #1a1a36;padding:12px 24px;display:flex;flex-wrap:wrap;gap:16px 28px;align-items:center}
+  1155→  1155→.cfg-group{display:flex;align-items:center;gap:8px}
+  1156→  1156→.cfg-label{color:#667;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:1px;min-width:80px}
+  1157→  1157→.cfg-val{color:#ff6b35;font-size:15px;font-weight:800;min-width:50px;text-align:right}
+  1158→  1158→input[type=range]{-webkit-appearance:none;appearance:none;height:6px;background:#1e1e3a;border-radius:3px;outline:none;width:120px;cursor:pointer}
+  1159→  1159→input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:16px;height:16px;border-radius:50%;background:#ff6b35;cursor:pointer;border:2px solid #08080e}
+  1160→  1160→.cfg-save{background:#ff6b3522;color:#ff6b35;border:1px solid #ff6b3544;padding:6px 16px;border-radius:5px;font-size:12px;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:0.5px;font-family:inherit;transition:all 0.15s}
+  1161→  1161→.cfg-save:hover{background:#ff6b3544;border-color:#ff6b35}
+  1162→  1162→.cfg-save:active{transform:scale(0.96)}
+  1163→  1163→.cfg-status{font-size:11px;color:#445;margin-left:8px}
+  1164→  1164→.cfg-tip{position:relative;cursor:help}
+  1165→  1165→.cfg-tip:hover .tip-box{display:block}
+  1166→  1166→.tip-box{display:none;position:absolute;bottom:130%;left:50%;transform:translateX(-50%);background:#1a1a2e;border:1px solid #2a2a4a;border-radius:6px;padding:8px 12px;font-size:11px;color:#aab;width:220px;z-index:999;line-height:1.4;text-transform:none;letter-spacing:0;white-space:normal;font-weight:400;box-shadow:0 4px 16px rgba(0,0,0,0.5)}
+  1167→  1167→.tip-box::after{content:'';position:absolute;top:100%;left:50%;margin-left:-5px;border-width:5px;border-style:solid;border-color:#1a1a2e transparent transparent transparent}
+  1168→  1168→
+  1169→  1169→.section{border-bottom:1px solid #14142a;padding:16px 24px}
+  1170→  1170→.section-title{font-size:14px;color:#778;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:12px;display:flex;align-items:center;gap:10px;font-weight:700}
+  1171→  1171→.section-title .info{color:#445;font-size:12px;text-transform:none;letter-spacing:0;font-weight:400}
+  1172→  1172→
+  1173→  1173→.g{color:#00ff88}.r{color:#ff4444}.y{color:#ffd700}.o{color:#ff6b35}.b{color:#00bfff}.dim{color:#445}
+  1174→  1174→table{width:100%;border-collapse:collapse;font-size:14px}
+  1175→  1175→th{text-align:left;color:#556;padding:8px 8px;border-bottom:2px solid #1e1e3a;font-weight:600;text-transform:uppercase;font-size:11px;letter-spacing:0.8px}
+  1176→  1176→td{padding:7px 8px;border-bottom:1px solid #12122a;font-weight:500}
+  1177→  1177→.tag{padding:2px 8px;border-radius:4px;font-size:12px;font-weight:700;letter-spacing:0.5px}
+  1178→  1178→.tag.long{background:#00ff8822;color:#00ff88}
+  1179→  1179→.tag.short{background:#ff444422;color:#ff4444}
+  1180→  1180→.tag.new{background:#ff6b3522;color:#ff6b35}
+  1181→  1181→.tag.tp{background:#00ff8822;color:#00ff88}
+  1182→  1182→.tag.sl{background:#ff444422;color:#ff4444}
+  1183→  1183→.tag.hold{background:#ffd70022;color:#ffd700}
+  1184→  1184→.tag.trail{background:#00bfff22;color:#00bfff}
+  1185→  1185→canvas{display:block}
+  1186→  1186→.err-box{color:#ff4444;font-size:14px;padding:10px 16px;background:#ff444415;border-radius:6px;margin:12px 24px;display:none;font-weight:600}
+  1187→  1187→.pos-row:hover{background:#12122e}
+  1188→  1188→
+  1189→  1189→/* Binance-style price flash animation */
+  1190→  1190→@keyframes flashGreen{0%{background:#00ff8844;box-shadow:inset 0 0 8px #00ff8866}100%{background:transparent;box-shadow:none}}
+  1191→  1191→@keyframes flashRed{0%{background:#ff444444;box-shadow:inset 0 0 8px #ff444466}100%{background:transparent;box-shadow:none}}
+  1192→  1192→.flash-up{animation:flashGreen 0.8s ease-out}
+  1193→  1193→.flash-down{animation:flashRed 0.8s ease-out}
+  1194→  1194→.mp{font-variant-numeric:tabular-nums;transition:color 0.2s;padding:3px 6px;border-radius:4px;min-width:100px;display:inline-block}
+  1195→  1195→.mp-up{color:#00ff88 !important}
+  1196→  1196→.mp-down{color:#ff4444 !important}
+  1197→  1197→.mp-arrow{font-size:14px;margin-left:3px;vertical-align:middle}
+  1198→  1198→.mp-arrow.up{color:#00ff88}
+  1199→  1199→.mp-arrow.down{color:#ff4444}
+  1200→  1200→.empty-msg{color:#445;font-style:italic;padding:6px 0;font-size:14px}
+  1201→  1201→.debug{color:#334;font-size:11px;padding:4px 24px}
+  1202→  1202→.scanner-section{opacity:0.85}
+  1203→  1203→.scanner-section table{font-size:13px}
+  1204→  1204→.scanner-section td,.scanner-section th{padding:5px 6px}
+  1205→  1205→</style>
+  1206→  1206→</head>
+  1207→  1207→<body>
+  1208→  1208→<div class="header">
+  1209→  1209→  <h1>&#9889; Claw-Binance Scalp</h1>
+  1210→  1210→  <div class="right">
+  1211→  1211→    <div class="pulse" id="pulse"></div>
+  1212→  1212→    <span class="badge-realistic">REALISTIC PAPER</span>
+  1213→  1213→    <span class="update-time" id="utime">connecting...</span>
+  1214→  1214→    <button id="btn-restart" onclick="restartBot()" style="margin-left:12px;padding:4px 14px;background:#1a1a2e;color:#ff9800;border:1px solid #ff9800;border-radius:4px;cursor:pointer;font-size:12px;font-weight:bold;transition:all 0.2s" onmouseover="this.style.background='#ff9800';this.style.color='#000'" onmouseout="this.style.background='#1a1a2e';this.style.color='#ff9800'">&#8635; RESTART</button>
+  1215→  1215→  </div>
+  1216→  1216→</div>
+  1217→  1217→<div class="err-box" id="err"></div>
+  1218→  1218→<div class="debug" id="dbg"></div>
+  1219→  1219→
+  1220→  1220→<div class="eq-bar" id="eq-bar">
+  1221→  1221→  <div class="eq-item"><span class="eq-lbl">Equity</span><span class="eq-val big" id="v-eq">--</span></div>
+  1222→  1222→  <div class="eq-item"><span class="eq-lbl">Balance</span><span class="eq-val" id="v-bal">--</span></div>
+  1223→  1223→  <div class="eq-item"><span class="eq-lbl">Margin Used</span><span class="eq-val" id="v-margin">--</span></div>
+  1224→  1224→  <div class="eq-item"><span class="eq-lbl">Unrealized PnL</span><span class="eq-val" id="v-upnl">--</span></div>
+  1225→  1225→  <div class="eq-item"><span class="eq-lbl">Total PnL</span><span class="eq-val" id="v-tpnl">--</span></div>
+  1226→  1226→  <div class="eq-item"><span class="eq-lbl">Trades / Win</span><span class="eq-val" id="v-trades">--</span></div>
+  1227→  1227→  <div class="eq-item"><span class="eq-lbl">Uptime</span><span class="eq-val y" style="font-size:18px" id="v-up">--</span></div>
+  1228→  1228→  <div class="eq-chart"><canvas id="chart"></canvas></div>
+  1229→  1229→</div>
+  1230→  1230→
+  1231→  1231→<div class="cost-bar" id="cost-bar">
+  1232→  1232→  <div class="cost-item"><span class="cost-lbl">Total Fees:</span><span class="cost-val r" id="v-fees">$0</span></div>
+  1233→  1233→  <div class="cost-item"><span class="cost-lbl">Spread Cost:</span><span class="cost-val o" id="v-spread">$0</span></div>
+  1234→  1234→  <div class="cost-item"><span class="cost-lbl">Rejected:</span><span class="cost-val y" id="v-rejected">0</span></div>
+  1235→  1235→  <div class="cost-item"><span class="cost-lbl">Fill Rate:</span><span class="cost-val b" id="v-fillrate">--</span></div>
+  1236→  1236→  <div class="cost-item"><span class="cost-lbl">Avg Slippage:</span><span class="cost-val o" id="v-slippage">--</span></div>
+  1237→  1237→  <div class="cost-item"><span class="cost-lbl">Taker Fee:</span><span class="cost-val dim">0.05%/side</span></div>
+  1238→  1238→</div>
+  1239→  1239→
+  1240→  1240→<div class="section">
+  1241→  1241→  <div class="section-title">&#128204; Open Positions <span class="info" id="pos-count"></span></div>
+  1242→  1242→  <div id="positions"><p class="empty-msg">Loading...</p></div>
+  1243→  1243→</div>
+  1244→  1244→
+  1245→  1245→<div class="cfg-bar" id="cfg-bar">
+  1246→  1246→  <div class="cfg-group">
+  1247→  1247→    <span class="cfg-label">TP %</span>
+  1248→  1248→    <input type="range" id="sl-tp" min="0.3" max="2.0" step="0.1" value="0.8">
+  1249→  1249→    <span class="cfg-val" id="sv-tp">0.8%</span>
+  1250→  1250→  </div>
+  1251→  1251→  <div class="cfg-group">
+  1252→  1252→    <span class="cfg-label">SL %</span>
+  1253→  1253→    <input type="range" id="sl-sl" min="0.2" max="1.5" step="0.1" value="0.7">
+  1254→  1254→    <span class="cfg-val" id="sv-sl">0.7%</span>
+  1255→  1255→  </div>
+  1256→  1256→  <div class="cfg-group">
+  1257→  1257→    <span class="cfg-label">Max Hold</span>
+  1258→  1258→    <input type="range" id="sl-hold" min="3" max="30" step="0.5" value="4">
+  1259→  1259→    <span class="cfg-val" id="sv-hold">4min</span>
+  1260→  1260→  </div>
+  1261→  1261→  <div class="cfg-group cfg-tip">
+  1262→  1262→    <span class="cfg-label">Trail % &#9432;</span>
+  1263→  1263→    <div class="tip-box"><b>Trailing Stop</b>: SL yang ngikutin harga. Kalau profit udah capai "Trail Act%", SL mulai ikutin harga. Kalau harga balik turun sebanyak "Trail%", auto exit &amp; lock profit. <b>Trailing aktif = TP fixed diabaikan</b>, supaya profit bisa lari lebih jauh dari TP.</div>
+  1264→  1264→    <input type="range" id="sl-trail" min="0.10" max="0.50" step="0.05" value="0.25">
+  1265→  1265→    <span class="cfg-val" id="sv-trail">0.25%</span>
+  1266→  1266→  </div>
+  1267→  1267→  <div class="cfg-group cfg-tip">
+  1268→  1268→    <span class="cfg-label">Trail Act % &#9432;</span>
+  1269→  1269→    <div class="tip-box"><b>Trail Activation</b>: Profit % minimum sebelum trailing stop aktif. Di bawah ini, trailing blom jalan &amp; cuma TP/SL biasa yang kerja. Setelah aktif, trailing stop menggantikan TP fixed.</div>
+  1270→  1270→    <input type="range" id="sl-trail-act" min="0.20" max="1.00" step="0.05" value="0.50">
+  1271→  1271→    <span class="cfg-val" id="sv-trail-act">0.50%</span>
+  1272→  1272→  </div>
+  1273→  1273→  <div class="cfg-group">
+  1274→  1274→    <span class="cfg-label">Max Pos</span>
+  1275→  1275→    <input type="range" id="sl-maxpos" min="1" max="10" step="1" value="5">
+  1276→  1276→    <span class="cfg-val" id="sv-maxpos">5</span>
+  1277→  1277→  </div>
+  1278→  1278→  <div class="cfg-group">
+  1279→  1279→    <span class="cfg-label">Size %</span>
+  1280→  1280→    <input type="range" id="sl-sizing" min="5" max="60" step="5" value="20">
+  1281→  1281→    <span class="cfg-val" id="sv-sizing">20%</span>
+  1282→  1282→  </div>
+  1283→  1283→  <div class="cfg-group cfg-tip">
+  1284→  1284→    <span class="cfg-label">Min Margin &#9432;</span>
+  1285→  1285→    <div class="tip-box"><b>Min Margin</b>: Minimum margin per trade as % of initial balance. If available balance drops below this, bot waits for a trade to close before opening new ones. Example: init=$10, min=15% → need at least $1.50 free to open.</div>
+  1286→  1286→    <input type="range" id="sl-minmargin" min="5" max="40" step="5" value="15">
+  1287→  1287→    <span class="cfg-val" id="sv-minmargin">15%</span>
+  1288→  1288→  </div>
+  1289→  1289→  <div class="cfg-group cfg-tip">
+  1290→  1290→    <span class="cfg-label">Leverage &#9432;</span>
+  1291→  1291→    <div class="tip-box"><b>Leverage</b>: Target leverage untuk semua trade. Otomatis di-cap ke max leverage tiap coin di Binance.</div>
+  1292→  1292→    <input type="range" id="sl-lev" min="1" max="125" step="1" value="20">
+  1293→  1293→    <span class="cfg-val" id="sv-lev">20x</span>
+  1294→  1294→  </div>
+  1295→  1295→  <button class="cfg-save" id="btn-save" onclick="saveConfig()">Apply</button>
+  1296→  1296→  <span class="cfg-status" id="cfg-status"></span>
+  1297→  1297→  <div class="cfg-group" style="margin-left:12px">
+  1298→  1298→    <span class="cfg-label">Init $</span>
+  1299→  1299→    <input type="range" id="sl-initbal" min="10" max="100" step="5" value="10">
+  1300→  1300→    <span class="cfg-val" id="sv-initbal">$10</span>
+  1301→  1301→  </div>
+  1302→  1302→  <button class="cfg-save" style="background:#ff980022;color:#ff9800;border-color:#ff980044" id="btn-reset-bal" onclick="resetBalance()">Reset Bal</button>
+  1303→  1303→</div>
+  1304→  1304→
+  1305→  1305→<div class="section">
+  1306→  1306→  <div class="section-title">&#128203; Recent Trades + Execution Details</div>
+  1307→  1307→  <div id="trades"><p class="empty-msg">Loading...</p></div>
+  1308→  1308→</div>
+  1309→  1309→
+  1310→  1310→<div class="section scanner-section">
+  1311→  1311→  <div class="section-title">&#128269; Scanner <span class="info" id="sinfo"></span></div>
+  1312→  1312→  <div id="scanner"><p class="empty-msg">Loading...</p></div>
+  1313→  1313→</div>
+  1314→  1314→
+  1315→  1315→<script>
+  1316→  1316→var API='/api/stats';
+  1317→  1317→var CFG_API='/api/config';
+  1318→  1318→var errCount=0;
+  1319→  1319→var pollId=null;
+  1320→  1320→var _initDone=false;
+  1321→  1321→var prevPrices={};
+  1322→  1322→
+  1323→  1323→function fmt(n,d){d=d||2;return(n!=null&&!isNaN(n))?Number(n).toFixed(d):'-'}
+  1324→  1324→function fUsd(n){return '$'+fmt(n)}
+  1325→  1325→function fPct(n){return(n>=0?'+':'')+fmt(n)+'%'}
+  1326→  1326→function fVol(n){return n>=1e9?(n/1e9).toFixed(1)+'B':n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(0)+'K':fmt(n,0)}
+  1327→  1327→function pcl(n){return n>0?'g':n<0?'r':''}
+  1328→  1328→function up(s){if(!s)return '0s';if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m '+(s%60)+'s';return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'}
+  1329→  1329→
+  1330→  1330→function $(id){return document.getElementById(id)}
+  1331→  1331→
+  1332→  1332→// Slider setup
+  1333→  1333→var sliders=[
+  1334→  1334→  {id:'sl-tp',vid:'sv-tp',suffix:'%',key:'take_profit_pct'},
+  1335→  1335→  {id:'sl-sl',vid:'sv-sl',suffix:'%',key:'stop_loss_pct'},
+  1336→  1336→  {id:'sl-hold',vid:'sv-hold',suffix:'min',key:'max_hold_min'},
+  1337→  1337→  {id:'sl-trail',vid:'sv-trail',suffix:'%',key:'trailing_stop_pct'},
+  1338→  1338→  {id:'sl-trail-act',vid:'sv-trail-act',suffix:'%',key:'trailing_activation_pct'},
+  1339→  1339→  {id:'sl-maxpos',vid:'sv-maxpos',suffix:'',key:'max_positions'},
+  1340→  1340→  {id:'sl-sizing',vid:'sv-sizing',suffix:'%',key:'sizing_pct'},
+  1341→  1341→  {id:'sl-minmargin',vid:'sv-minmargin',suffix:'%',key:'min_margin_pct'},
+  1342→  1342→  {id:'sl-lev',vid:'sv-lev',suffix:'x',key:'leverage'}
+  1343→  1343→];
+  1344→  1344→var elInit=$('sl-initbal');
+  1345→  1345→if(elInit){elInit.addEventListener('input',function(){$('sv-initbal').textContent='$'+elInit.value})}
+  1346→  1346→for(var i=0;i<sliders.length;i++){
+  1347→  1347→  (function(s){
+  1348→  1348→    var el=$(s.id);
+  1349→  1349→    el.addEventListener('input',function(){$(s.vid).textContent=el.value+s.suffix});
+  1350→  1350→  })(sliders[i]);
+  1351→  1351→}
+  1352→  1352→
+  1353→  1353→function setSlidersFromConfig(sc,p){
+  1354→  1354→  if(!sc)return;
+  1355→  1355→  if(sc.take_profit_pct!=null){$('sl-tp').value=sc.take_profit_pct;$('sv-tp').textContent=sc.take_profit_pct+'%'}
+  1356→  1356→  if(sc.stop_loss_pct!=null){$('sl-sl').value=sc.stop_loss_pct;$('sv-sl').textContent=sc.stop_loss_pct+'%'}
+  1357→  1357→  if(sc.max_hold_sec!=null){var hm=(sc.max_hold_sec/60).toFixed(1);$('sl-hold').value=hm;$('sv-hold').textContent=hm+'min'}
+  1358→  1358→  if(sc.trailing_stop_pct!=null){$('sl-trail').value=sc.trailing_stop_pct;$('sv-trail').textContent=sc.trailing_stop_pct+'%'}
+  1359→  1359→  if(sc.trailing_activation_pct!=null){$('sl-trail-act').value=sc.trailing_activation_pct;$('sv-trail-act').textContent=sc.trailing_activation_pct+'%'}
+  1360→  1360→  if(sc.max_positions!=null){$('sl-maxpos').value=sc.max_positions;$('sv-maxpos').textContent=sc.max_positions}
+  1361→  1361→  if(sc.sizing_pct!=null){var sp=Math.round(sc.sizing_pct*100);$('sl-sizing').value=sp;$('sv-sizing').textContent=sp+'%'}
+  1362→  1362→  if(sc.min_margin_pct!=null){var mm=Math.round(sc.min_margin_pct*100);$('sl-minmargin').value=mm;$('sv-minmargin').textContent=mm+'%'}
+  1363→  1363→  if(sc.leverage!=null){$('sl-lev').value=sc.leverage;$('sv-lev').textContent=sc.leverage+'x'}
+  1364→  1364→  var elInit=$('sl-initbal');
+  1365→  1365→  if(elInit&&p&&p.initial_balance){elInit.value=p.initial_balance;$('sv-initbal').textContent='$'+p.initial_balance}
+  1366→  1366→}
+  1367→  1367→
+  1368→  1368→function saveConfig(){
+  1369→  1369→  var cfg={
+  1370→  1370→    take_profit_pct:parseFloat($('sl-tp').value),
+  1371→  1371→    stop_loss_pct:parseFloat($('sl-sl').value),
+  1372→  1372→    max_hold_sec:Math.round(parseFloat($('sl-hold').value)*60),
+  1373→  1373→    trailing_stop_pct:parseFloat($('sl-trail').value),
+  1374→  1374→    trailing_activation_pct:parseFloat($('sl-trail-act').value),
+  1375→  1375→    max_positions:parseInt($('sl-maxpos').value),
+  1376→  1376→    sizing_pct:parseFloat($('sl-sizing').value)/100,
+  1377→  1377→    min_margin_pct:parseFloat($('sl-minmargin').value)/100,
+  1378→  1378→    leverage:parseInt($('sl-lev').value)
+  1379→  1379→  };
+  1380→  1380→  $('cfg-status').textContent='Saving...';
+  1381→  1381→  fetch(CFG_API,{
+  1382→  1382→    method:'POST',
+  1383→  1383→    headers:{'Content-Type':'application/json'},
+  1384→  1384→    body:JSON.stringify(cfg)
+  1385→  1385→  })
+  1386→  1386→  .then(function(r){
+  1387→  1387→    if(!r.ok) throw new Error('HTTP '+r.status);
+  1388→  1388→    return r.json();
+  1389→  1389→  })
+  1390→  1390→  .then(function(d){
+  1391→  1391→    $('cfg-status').textContent='Saved! '+JSON.stringify(d.applied);
+  1392→  1392→    $('cfg-status').style.color='#ff6b35';
+  1393→  1393→    setSlidersFromConfig(d.applied);
+  1394→  1394→    setTimeout(function(){$('cfg-status').textContent='';$('cfg-status').style.color=''},3000);
+  1395→  1395→  })
+  1396→  1396→  .catch(function(e){
+  1397→  1397→    $('cfg-status').textContent='Error: '+e.message;
+  1398→  1398→    $('cfg-status').style.color='#ff4444';
+  1399→  1399→  });
+  1400→  1400→}
+  1401→  1401→
+  1402→  1402→function restartBot(){
+  1403→  1403→  if(!confirm('Restart bot? Current positions will be closed.'))return;
+  1404→  1404→  var btn=$('btn-restart');
+  1405→  1405→  btn.disabled=true;btn.textContent='Restarting...';btn.style.opacity='0.5';
+  1406→  1406→  fetch('/api/restart',{method:'POST'})
+  1407→  1407→    .then(function(r){return r.json()})
+  1408→  1408→    .then(function(d){
+  1409→  1409→      btn.textContent='Restarted!';
+  1410→  1410→      // Start polling after 3s (systemd RestartSec=5, give extra 2s buffer)
+  1411→  1411→      setTimeout(function(){btn.textContent='Reconnecting...';poll()},3000);
+  1412→  1412→      setTimeout(function(){btn.disabled=false;btn.innerHTML='&#8635; RESTART';btn.style.opacity='1'},10000);
+  1413→  1413→    })
+  1414→  1414→    .catch(function(e){
+  1415→  1415→      // fetch fails because bot is shutting down — expected!
+  1416→  1416→      btn.textContent='Restarting...';
+  1417→  1417→      setTimeout(function(){poll()},5000);
+  1418→  1418→      setTimeout(function(){btn.disabled=false;btn.innerHTML='&#8635; RESTART';btn.style.opacity='1'},10000);
+  1419→  1419→    });
+  1420→  1420→}
+  1421→  1421→
+  1422→  1422→function resetBalance(){
+  1423→  1423→  var val=parseInt($('sl-initbal').value);
+  1424→  1424→  if(!confirm('Reset balance to $'+val+'? All positions will be closed and stats reset.'))return;
+  1425→  1425→  var btn=$('btn-reset-bal');
+  1426→  1426→  btn.disabled=true;btn.textContent='Resetting...';btn.style.opacity='0.5';
+  1427→  1427→  fetch('/api/reset_balance',{
+  1428→  1428→    method:'POST',
+  1429→  1429→    headers:{'Content-Type':'application/json'},
+  1430→  1430→    body:JSON.stringify({initial_balance:val})
+  1431→  1431→  })
+  1432→  1432→  .then(function(r){return r.json()})
+  1433→  1433→  .then(function(d){
+  1434→  1434→    btn.textContent='Reset!';
+  1435→  1435→    $('cfg-status').textContent='Balance reset to $'+val;
+  1436→  1436→    $('cfg-status').style.color='#ff9800';
+  1437→  1437→    setTimeout(function(){$('cfg-status').textContent='';$('cfg-status').style.color=''},3000);
+  1438→  1438→    setTimeout(function(){btn.disabled=false;btn.textContent='Reset Bal';btn.style.opacity='1'},3000);
+  1439→  1439→  })
+  1440→  1440→  .catch(function(e){
+  1441→  1441→    $('cfg-status').textContent='Error: '+e.message;
+  1442→  1442→    $('cfg-status').style.color='#ff4444';
+  1443→  1443→    btn.disabled=false;btn.textContent='Reset Bal';btn.style.opacity='1';
+  1444→  1444→  });
+  1445→  1445→}
+  1446→  1446→
+  1447→  1447→function poll(){
+  1448→  1448→  fetch(API+'?t='+Date.now())
+  1449→  1449→    .then(function(r){
+  1450→  1450→      if(!r.ok) throw new Error('HTTP '+r.status);
+  1451→  1451→      return r.json();
+  1452→  1452→    })
+  1453→  1453→    .then(function(d){
+  1454→  1454→      render(d);
+  1455→  1455→      if(!_initDone){setSlidersFromConfig(d.config,d.portfolio);_initDone=true}
+  1456→  1456→      errCount=0;
+  1457→  1457→      $('pulse').className='pulse';
+  1458→  1458→      $('err').style.display='none';
+  1459→  1459→      $('utime').textContent='Live - '+new Date().toLocaleTimeString();
+  1460→  1460→    })
+  1461→  1461→    .catch(function(e){
+  1462→  1462→      errCount++;
+  1463→  1463→      $('pulse').className='pulse off';
+  1464→  1464→      if(errCount>1){
+  1465→  1465→        $('err').textContent='API Error: '+e.message+' (retry #'+errCount+')';
+  1466→  1466→        $('err').style.display='block';
+  1467→  1467→      }
+  1468→  1468→      $('dbg').textContent='fetch error: '+e.message;
+  1469→  1469→    });
+  1470→  1470→}
+  1471→  1471→
+  1472→  1472→function render(d){
+  1473→  1473→  try{
+  1474→  1474→    var p=d.portfolio||{};
+  1475→  1475→    var gr=p.growth_pct||0;
+  1476→  1476→    var eq=p.equity||0;
+  1477→  1477→    var init=p.initial_balance||0;
+  1478→  1478→    var bot=d.bot||{};
+  1479→  1479→
+  1480→  1480→    $('v-eq').innerHTML=fUsd(eq)+' <span class="eq-sub">'+fPct(gr)+'</span>';
+  1481→  1481→    $('v-eq').className='eq-val big '+pcl(gr);
+  1482→  1482→    $('v-bal').textContent=fUsd(p.balance_usd);
+  1483→  1483→    $('v-margin').textContent=fUsd(p.margin_deployed);
+  1484→  1484→    if(p.trading_paused){
+  1485→  1485→      $('err').textContent='TRADING PAUSED: Drawdown -'+(p.drawdown_pct||0).toFixed(1)+'% or balance too low ($'+fmt(p.balance_usd)+'). Waiting for recovery...';
+  1486→  1486→      $('err').style.display='block';
+  1487→  1487→    }
+  1488→  1488→    $('v-upnl').textContent=fUsd(p.unrealized_pnl);
+  1489→  1489→    $('v-upnl').className='eq-val '+pcl(p.unrealized_pnl);
+  1490→  1490→    $('v-tpnl').textContent=fUsd(p.total_pnl);
+  1491→  1491→    $('v-tpnl').className='eq-val '+pcl(p.total_pnl);
+  1492→  1492→    $('v-trades').innerHTML=(p.total_trades||0)+' <span class="eq-sub">('+fmt(p.win_rate,0)+'% win)</span>';
+  1493→  1493→    $('v-up').textContent=up(bot.uptime_sec||0);
+  1494→  1494→
+  1495→  1495→    // Cost bar
+  1496→  1496→    $('v-fees').textContent=fUsd(p.total_fees||0);
+  1497→  1497→    $('v-spread').textContent=fUsd(p.total_spread_cost||0);
+  1498→  1498→    $('v-rejected').textContent=(p.rejected_orders||0);
+  1499→  1499→    var exec=d.executor||{};
+  1500→  1500→    $('v-fillrate').textContent=(exec.fill_rate?((exec.fill_rate*100).toFixed(1)+'%'):'--');
+  1501→  1501→    $('v-slippage').textContent=(exec.avg_slippage_bps?exec.avg_slippage_bps.toFixed(1)+'bps':'--');
+  1502→  1502→
+  1503→  1503→    $('dbg').textContent='cycles='+(bot.cycles||0)+' pos='+(d.positions||[]).length+' trades='+(d.trades||[]).length;
+  1504→  1504→
+  1505→  1505→    drawChart(p.equity_history||[],init);
+  1506→  1506→
+  1507→  1507→    $('pos-count').textContent='('+(d.positions||[]).length+' active)';
+  1508→  1508→    renderPositions(d.positions||[]);
+  1509→  1509→    renderTrades(d.trades||[]);
+  1510→  1510→    renderScanner(d.scanner||{});
+  1511→  1511→
+  1512→  1512→  }catch(e){
+  1513→  1513→    $('dbg').textContent='RENDER ERROR: '+e.message;
+  1514→  1514→    console.error('render error:',e);
+  1515→  1515→  }
+  1516→  1516→}
+  1517→  1517→
+  1518→  1518→function drawChart(hist,init){
+  1519→  1519→  var c=$('chart');
+  1520→  1520→  if(!c)return;
+  1521→  1521→  var ctx=c.getContext('2d');
+  1522→  1522→  var W=c.offsetWidth;
+  1523→  1523→  var H=c.offsetHeight;
+  1524→  1524→  if(W<10||H<10)return;
+  1525→  1525→  c.width=W;c.height=H;
+  1526→  1526→  ctx.clearRect(0,0,W,H);
+  1527→  1527→  if(!hist||hist.length<2)return;
+  1528→  1528→  var vals=hist.map(function(h){return h.v});
+  1529→  1529→  var minV=Math.min.apply(null,vals.concat([init]))*0.998;
+  1530→  1530→  var maxV=Math.max.apply(null,vals.concat([init]))*1.002;
+  1531→  1531→  var range=maxV-minV||1;
+  1532→  1532→  var toX=function(i){return(i/(vals.length-1))*W};
+  1533→  1533→  var toY=function(v){return H-((v-minV)/range)*H};
+  1534→  1534→  var last=vals[vals.length-1];
+  1535→  1535→
+  1536→  1536→  ctx.beginPath();ctx.moveTo(toX(0),toY(vals[0]));
+  1537→  1537→  for(var i=1;i<vals.length;i++)ctx.lineTo(toX(i),toY(vals[i]));
+  1538→  1538→  ctx.lineTo(toX(vals.length-1),H);ctx.lineTo(toX(0),H);ctx.closePath();
+  1539→  1539→  var grad=ctx.createLinearGradient(0,0,0,H);
+  1540→  1540→  if(last>=init){grad.addColorStop(0,'rgba(255,107,53,0.25)');grad.addColorStop(1,'rgba(255,107,53,0)');}
+  1541→  1541→  else{grad.addColorStop(0,'rgba(255,68,68,0.25)');grad.addColorStop(1,'rgba(255,68,68,0)');}
+  1542→  1542→  ctx.fillStyle=grad;ctx.fill();
+  1543→  1543→
+  1544→  1544→  ctx.beginPath();
+  1545→  1545→  for(var i=0;i<vals.length;i++){if(i===0)ctx.moveTo(toX(i),toY(vals[i]));else ctx.lineTo(toX(i),toY(vals[i]));}
+  1546→  1546→  ctx.strokeStyle=last>=init?'#ff6b35':'#ff4444';ctx.lineWidth=2;ctx.stroke();
+  1547→  1547→
+  1548→  1548→  ctx.beginPath();ctx.moveTo(0,toY(init));ctx.lineTo(W,toY(init));
+  1549→  1549→  ctx.strokeStyle='#ffd700';ctx.lineWidth=1;ctx.setLineDash([5,5]);ctx.stroke();ctx.setLineDash([]);
+  1550→  1550→
+  1551→  1551→  ctx.fillStyle=last>=init?'#ff6b35':'#ff4444';
+  1552→  1552→  ctx.font='bold 13px monospace';
+  1553→  1553→  ctx.fillText('$'+last.toFixed(2)+' ('+(last-init>=0?'+':'')+((last/init-1)*100).toFixed(2)+'%)',6,16);
+  1554→  1554→}
+  1555→  1555→
+  1556→  1556→function renderScanner(s){
+  1557→  1557→  var top=s.top_markets||[];
+  1558→  1558→  $('sinfo').textContent=(s.total_markets||0)+' mkts | '+(s.filtered_markets||0)+' pass | '+(s.new_listings||0)+' new';
+  1559→  1559→  if(!top.length){$('scanner').innerHTML='<p class="empty-msg">Scanning...</p>';return;}
+  1560→  1560→  var h='<table><tr><th>#</th><th>Symbol</th><th>Vol 24h</th><th>Chg%</th><th>Age</th><th>Score</th><th>Funding</th></tr>';
+  1561→  1561→  for(var i=0;i<Math.min(top.length,7);i++){
+  1562→  1562→    var m=top[i];
+  1563→  1563→    var age=m.is_new_listing?'<span class="tag new">NEW '+m.listing_age_days.toFixed(0)+'d</span>':m.listing_age_days.toFixed(0)+'d';
+  1564→  1564→    h+='<tr><td>'+(i+1)+'</td><td><strong>'+(m.base_asset||m.symbol)+'</strong></td><td>'+fVol(m.quote_volume_24h_m*1e6)+'</td><td class="'+pcl(m.price_change_pct)+'">'+fPct(m.price_change_pct)+'</td><td>'+age+'</td><td style="color:#ffd700">'+fmt(m.total_score,1)+'</td><td>'+fmt((m.funding_rate||0)*100,4)+'%</td></tr>';
+  1565→  1565→  }
+  1566→  1566→  h+='</table>';$('scanner').innerHTML=h;
+  1567→  1567→}
+  1568→  1568→
+  1569→  1569→function renderPositions(pos){
+  1570→  1570→  if(!pos.length){$('positions').innerHTML='<p class="empty-msg">No open positions</p>';return;}
+  1571→  1571→  var h='<table><tr><th>Symbol</th><th>Side</th><th>Entry</th><th>Mid</th><th>Current</th><th>Lev</th><th>Margin</th><th>Notional</th><th>PnL%</th><th>PnL $</th><th>TP/SL</th><th>Peak</th><th>Trail</th><th>Hold</th><th>Signal</th></tr>';
+  1572→  1572→  for(var i=0;i<pos.length;i++){
+  1573→  1573→    var p=pos[i];
+  1574→  1574→    var ep=p.entry_price||0;
+  1575→  1575→    var mp=p.current_price||0;
+  1576→  1576→    // Binance-style flash: detect price direction change
+  1577→  1577→    var prev=prevPrices[p.symbol];
+  1578→  1578→    var dir=0;
+  1579→  1579→    if(prev!=null&&mp!==prev){dir=mp>prev?1:-1}
+  1580→  1580→    prevPrices[p.symbol]=mp;
+  1581→  1581→    var mpClass='mp';
+  1582→  1582→    var arrowHtml='';
+  1583→  1583→    if(dir>0){mpClass+=' mp-up flash-up';arrowHtml='<span class="mp-arrow up">&#9650;</span>'}
+  1584→  1584→    else if(dir<0){mpClass+=' mp-down flash-down';arrowHtml='<span class="mp-arrow down">&#9660;</span>'}
+  1585→  1585→    else{arrowHtml='<span class="dim" style="font-size:10px">&#9679;</span>'}
+  1586→  1586→    var mpStr='<strong>'+fmt(mp,6)+'</strong> '+arrowHtml;
+  1587→  1587→    var peakTag=p.highest_pnl_pct>0?'<span class="y">'+fPct(p.highest_pnl_pct)+'</span>':'<span class="dim">--</span>';
+  1588→  1588→    var trailTag=p.trailing_active?'<span class="b">ON</span>':'<span class="dim">off</span>';
+  1589→  1589→    h+='<tr class="pos-row"><td><strong>'+p.symbol+'</strong></td><td><span class="tag '+p.side.toLowerCase()+'">'+p.side+'</span></td><td>'+fmt(ep,6)+'</td><td class="dim">'+fmt(p.mid_price,6)+'</td><td class="'+mpClass+'">'+mpStr+'</td><td class="b">'+p.leverage+'x</td><td>$'+fmt(p.margin_usd)+'</td><td>$'+fmt(p.notional_usd)+'</td><td class="'+pcl(p.unrealized_pnl_pct)+'"><strong>'+fPct(p.unrealized_pnl_pct)+'</strong></td><td class="'+pcl(p.unrealized_pnl)+'"><strong>'+fUsd(p.unrealized_pnl)+'</strong></td><td style="font-size:11px"><span class="g">TP:'+p.tp+'</span>/<span class="r">SL:'+p.sl+'</span></td><td>'+peakTag+'</td><td>'+trailTag+'</td><td>'+Math.round(p.hold_sec||0)+'s</td><td class="dim" style="font-size:11px">'+(p.signal_reason||'')+'</td></tr>';
+  1590→  1590→  }
+  1591→  1591→  h+='</table>';$('positions').innerHTML=h;
+  1592→  1592→}
+  1593→  1593→
+  1594→  1594→function renderTrades(trades){
+  1595→  1595→  if(!trades.length){$('trades').innerHTML='<p class="empty-msg">No trades yet</p>';return;}
+  1596→  1596→  var h='<table><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Entry</th><th>Exit</th><th>Lev</th><th>Size</th><th>Notional</th><th>PnL%</th><th>PnL $</th><th>Fees</th><th>Spread</th><th>E.Slip</th><th>X.Slip</th><th>Hold</th><th>Exit</th><th>Signal</th></tr>';
+  1597→  1597→  var list=trades.slice().reverse();
+  1598→  1598→  for(var i=0;i<list.length;i++){
+  1599→  1599→    var t=list[i];
+  1600→  1600→    var ts=new Date(t.time*1000).toLocaleTimeString();
+  1601→  1601→    var ec=t.exit_reason==='TP_HIT'?'tp':t.exit_reason==='SL_HIT'?'sl':t.exit_reason==='TRAILING_STOP'?'trail':'hold';
+  1602→  1602→    var sizeStr='$'+fmt(t.margin_usd,2);
+  1603→  1603→    var notionalStr='$'+fmt(t.notional_usd,2);
+  1604→  1604→    h+='<tr><td>'+ts+'</td><td><strong>'+t.symbol+'</strong></td><td><span class="tag '+t.side.toLowerCase()+'">'+t.side+'</span></td><td>'+fmt(t.entry,6)+'</td><td>'+fmt(t.exit,6)+'</td><td class="b">'+t.leverage+'x</td><td>'+sizeStr+'</td><td>'+notionalStr+'</td><td class="'+pcl(t.pnl_pct)+'"><strong>'+fPct(t.pnl_pct)+'</strong></td><td class="'+pcl(t.pnl_usd)+'"><strong>'+fUsd(t.pnl_usd)+'</strong></td><td class="o">$'+fmt(t.total_fees_usd,4)+'</td><td class="o">$'+fmt(t.spread_cost_usd,4)+'</td><td class="dim">'+fmt(t.entry_slippage_bps,1)+'bps</td><td class="dim">'+fmt(t.exit_slippage_bps,1)+'bps</td><td>'+Math.round(t.hold_sec)+'s</td><td><span class="tag '+ec+'">'+t.exit_reason+'</span>'+(t.is_partial_fill?' <span class="r">PF</span>':'')+'</td><td class="dim" style="font-size:11px">'+(t.reason||'')+'</td></tr>';
+  1605→  1605→  }
+  1606→  1606→  h+='</table>';$('trades').innerHTML=h;
+  1607→  1607→}
+  1608→  1608→
+  1609→  1609→poll();
+  1610→  1610→pollId=setInterval(poll,3000);
+  1611→  1611→</script>
+  1612→  1612→</body>
+  1613→  1613→</html>"""
+  1614→  1614→
+  1615→  1615→
+  1616→  1616→
+  1617→  1617→# ─── Main ─────────────────────────────────────────────────
+  1618→  1618→
+  1619→  1619→def main():
+  1620→  1620→    import sys
+  1621→  1621→
+  1622→  1622→    config_path = sys.argv[1] if len(sys.argv) > 1 else "binance_config_realistic.yaml"
+  1623→  1623→
+  1624→  1624→    logging.basicConfig(
+  1625→  1625→        level=logging.INFO,
+  1626→  1626→        format="%(asctime)s [%(name)s] %(message)s",
+  1627→  1627→        datefmt="%H:%M:%S",
+  1628→  1628→    )
+  1629→  1629→
+  1630→  1630→    bot = BinanceFuturesBotRealistic(config_path)
+  1631→  1631→    bot.run()
+  1632→  1632→
+  1633→  1633→
+  1634→  1634→if __name__ == "__main__":
+  1635→  1635→    main()
+  1636→  1636→
