@@ -14,7 +14,7 @@
 | Average loss (SL hit) | -0.6% to -0.8% | Config SL 0.5% + fee drag |
 | Worst SL exit | -1.60% | Polling overshoot + fee |
 | Typical SL exit | -0.72% to -0.82% | 0.5% SL + 0.10% fee + ~0.2% overshoot |
-| Expectancy | Slightly positive to breakeven | Borderline unprofitable |
+| Expectancy | **-0.21% per trade (NEGATIVE)** | Structurally unprofitable (confirmed by AI analysis) |
 | Session duration | 2-8 hours | Paper trading sessions |
 | Starting bankroll | $10 | Fixed for all sessions |
 
@@ -145,3 +145,66 @@ What we DON'T have but need:
 | Meme vs major WR | Market type filter | Add is_meme flag to trade DB |
 
 The bot's SQLite database (`trade_db.py`) tracks 40+ columns per trade including: symbol, side, entry/exit price, PnL decomposition (fee, spread, slippage), confidence, signal_reason, hold_sec, leverage, etc. **This data exists on the running bot's server but is not available in this review repository.**
+
+---
+
+## 9. AI Analysis Findings (Round 2)
+
+> Findings from Claude's analysis of insight.md + insight_followup.md
+
+### Current EV Calculation
+
+```
+EV per trade = WR × avg_win - (1-WR) × avg_loss - round_trip_cost
+            = 0.40 × 0.95% - 0.60 × 0.65% - 0.20%
+            = 0.38% - 0.39% - 0.20%
+            = -0.21%
+```
+**Conclusion: The strategy is structurally negative expectancy. No leverage can fix this.**
+
+### Proposed Parameter Set (Claude, Round 2)
+
+| Parameter | Current | Proposed | Rationale |
+|-----------|---------|----------|-----------|
+| TP | 1.0% | 3.0% | Reduce cost/TP ratio from 17.8% → 5.9% |
+| SL | 0.5% | 2.0% | Wider stops survive noise |
+| Leverage | 20x | 8x | Reduce ruin factor from 20 → 8 |
+| Position size | 20% equity | 20% equity | Same |
+| Confidence threshold | 0.54 (additive) | 0.60 (multiplicative) | AND-gate filter |
+| ADX | 15 | 18 | Compromise pending A/B test |
+| Momentum threshold | 0.08% fixed | max(0.03%, 0.04×ATR%) | ATR-adaptive with floor |
+| Max positions | 5 | 5 | Same |
+
+**Breakeven WR at proposed params: 44% (using `(2+0.2)/5`)**
+**Estimated WR at proposed params: 38-45% (needs replay validation)**
+
+### Multiplicative Confidence Formula (AND-Gate)
+
+```python
+vol_score = min(1, vol_ratio / 5)
+mom_score = min(1, |momentum| / 1.0)
+confidence = 0.50 + 0.35 * (vol_score * mom_score)
+```
+
+- Weak signal (vol=2x, mom=0.08%): 0.4 × 0.08 = 0.032 → confidence = 0.511 → **REJECTED** (below 0.60)
+- Strong signal (vol=4x, mom=0.5%): 0.8 × 0.5 = 0.40 → confidence = 0.64 → **ACCEPTED**
+
+### Ruin Math
+
+`worst_case_loss_fraction = N × e × L × SL%`
+- Current (N=5, e=0.2, L=20, SL=0.5%): 5 × 0.2 × 20 × 0.005 = 10% → seems ok
+- But with SL overshoot (0.8% actual): 5 × 0.2 × 20 × 0.008 = 16%
+- Proposed (N=5, e=0.2, L=8, SL=2%): 5 × 0.2 × 8 × 0.02 = 16% → same dollar risk, wider stops
+
+### Key Blocked Questions (Need Replay)
+
+1. **WR at TP 3%/SL 2%** — estimated 38-45%, but only replay can confirm
+2. **MFE distribution** — what % of trades reach 3%+ favorable?
+3. **Time-to-TP at 3%** — how long do we hold on average?
+4. **Per-tier WR** — which tiers are negative vs positive expectancy?
+
+### Minimum Bankroll for Profitability
+
+At TP 3%/SL 2%/WR 45%, EV = 0.05% per trade:
+- For $1/day profit: $1000 bankroll needed (10 trades/day × 20% sizing)
+- At $10 bankroll: this is a validation phase, not a profit phase
