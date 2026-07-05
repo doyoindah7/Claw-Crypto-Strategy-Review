@@ -101,7 +101,7 @@ Direct cause: EV per trade = -0.21% (structurally negative)
     │               │
     │               └──► Why 20x? $10 bankroll needs leverage for meaningful PnL
     │
-    ├──► Why? Win rate 35-45% < breakeven 45.2%
+    ├──► Why? Win rate 35-45% < breakeven 54.3% (using effective SL 0.8%)
     │       │
     │       ├──► Why? SL 0.5% gets hit by noise on meme coins
     │       │       │
@@ -314,10 +314,34 @@ These are the questions where a second (or third) independent opinion would be m
 - R14: full simulation realism audit with rating for each component
 
 ### Round 4 (`insight_r4.md`) — Foundation Fixes + Side Quests
-- 11 questions (S1-S11) on exact implementation specs
-- Slippage mixture distribution design
-- Position sizing at $10 with $5 Binance minimum
-- Binance OCO / conditional order mechanics
-- Replay pipeline ambiguity handling
-- Meta question: pivot to measurement-first approach?
-- **NEW (this update)**: Side-quest questions on alternative strategy research (see R4 update)
+- 17 questions (S1-S17) on implementation specs + alternative strategy research
+- Slippage mixture distribution design (S2-S4)
+- Position sizing at $10 with $5 Binance minimum (S5-S7)
+- Binance OCO / conditional order mechanics (S8-S9)
+- Replay pipeline ambiguity handling (S10)
+- Meta question: pivot to measurement-first approach? (S11)
+- Side-quest: HFT scalping, swing trading, Fifteen translation, profitable bot lit review, strategy ranking, $10 viability (S12-S17)
+
+### Cross-Validation Round (Claude R4 responses + Kimi/ZAI R1 integration)
+
+**Key new findings:**
+
+| Finding | Detail | Impact |
+|---------|--------|--------|
+| **Breakeven WR = 54.3%** (Claude recalculation) | Using EFFECTIVE SL 0.8% (observed), not configured SL 0.5%, and NOT adding overshoot as symmetric cost | Even higher than Kimi's 51.7% — strategy is MORE dead than anyone calculated |
+| **Math error in S7** | Worst-case 3 SL hits = 3.6% bankroll (not 10.8% as we wrote — triple-counting error) | L=3/N=3/e=20% is actually safer than we thought |
+| **Leverage "red herring" = same claim** | ZAI and Claude say the same thing in different words — fee/SL ratio invariant to leverage | No real disagreement |
+| **No audited profitable crypto bot exists publicly** | Claude searched — landscape is marketing content only, no independent audit | Honest confirmation the field is barren |
+| **Fifteen R:R >1.5:1 confirmed** | TP8/SL5 breakeven = 39.2% at 40% WR = marginal profit ✓ | Viable pivot direction |
+| **WR at wide stops = GENUINELY UNRESOLVED** | Both directions valid logically, only empirical data resolves it | Replay pipeline is THE unblocker |
+| **AND-gate + log-scale volume = compatible** | Replace linear vol_score with `min(1, log2(vol_ratio)*k)` in multiplicative formula | Combined best of Claude + ZAI proposals |
+
+**Breakeven WR — The Critical Resolution:**
+
+| Method | Breakeven WR | Who | Correct? |
+|--------|-------------|------|----------|
+| Config SL 0.5%, no overshoot | 45.2% | Claude R2, ZAI | Understates real SL impact |
+| Config SL 0.5%, overshoot as symmetric cost | 51.7% | Kimi | Overshoot isn't symmetric (doesn't affect TP) |
+| **Effective SL 0.8%, no symmetric overshoot** | **54.3%** | **Claude R4 recalc** | **Most accurate — uses observed SL exit** |
+
+**Conclusion**: The true breakeven WR at current parameters is **54.3%**. Our actual WR is 35-45%. The gap is 9-19 percentage points. The strategy is not just negative EV — it's deeply, structurally negative.
